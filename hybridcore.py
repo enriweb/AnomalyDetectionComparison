@@ -1,9 +1,17 @@
 """
-UniNet
+HybridCore: Dual-Encoder Coreset Anomaly Detection
+
+Novel architecture combining CNN pyramid features (WideResNet-50) with ViT patch
+tokens (DeiT-Tiny) in a single unified coreset memory bank. No gradient training —
+both encoders are frozen pretrained models.
+
+Novelty: First gradient-free dual-encoder coreset model fusing independent CNN
+         pyramid features and ViT patch tokens in a joint memory bank. Distinct
+         from MobileViT (single fused backbone) and PatchCore (CNN-only).
 
 Usage:
-    python uninet.py          # 1 run (default)
-    python uninet.py 3        # 3 runs, results averaged
+    python hybridcore.py          # 1 run (default)
+    python hybridcore.py 3        # 3 runs, results averaged
 """
 
 import gc
@@ -13,14 +21,23 @@ import statistics
 import sys
 import time
 
+import timm
 import torch
-from anomalib.data import MVTecAD, Visa
+import torch.nn.functional as F
+from anomalib.data import InferenceBatch, MVTecAD, Visa
 from anomalib.engine import Engine
 from anomalib.metrics import AUPRO, AUROC, Evaluator
-from anomalib.models import UniNet
+from anomalib.models import Patchcore
+from anomalib.models.image.patchcore.torch_model import PatchcoreModel
 
 # ── How many runs to average ──────────────────────────────────
 N_RUNS: int = int(sys.argv[1]) if len(sys.argv) > 1 else 1
+
+CNN_BACKBONE = "wide_resnet50_2"
+CNN_LAYERS   = ["layer2", "layer3"]
+VIT_NAME     = "deit_tiny_patch16_224"
+CORESET_RATIO = 0.25
+NUM_NEIGHBORS = 9
 
 MVTEC_CATEGORIES = [
     "bottle", "cable", "capsule", "carpet", "grid",
@@ -38,7 +55,7 @@ DATASETS = [
 ]
 
 os.makedirs("results", exist_ok=True)
-PROGRESS_FILE = "results/uninet_progress.json"
+PROGRESS_FILE = "results/hybridcore_progress.json"
 
 if os.path.exists(PROGRESS_FILE):
     with open(PROGRESS_FILE) as f:
@@ -46,6 +63,82 @@ if os.path.exists(PROGRESS_FILE):
     print(f"Resuming from {PROGRESS_FILE}")
 else:
     results = {ds: {} for ds, *_ in DATASETS}
+
+
+# ── Model ─────────────────────────────────────────────────────
+
+class HybridCoreModel(PatchcoreModel):
+    """PatchcoreModel extended with a frozen DeiT-Tiny ViT branch.
+
+    CNN features (WRN50 layer2+layer3) and ViT patch tokens (DeiT-Tiny) are
+    spatially aligned and concatenated before the coreset memory bank.
+    Embedding dim: 1536 (CNN) + 192 (ViT) = 1728.
+    """
+
+    def __init__(self, vit_name: str = VIT_NAME, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.vit = timm.create_model(vit_name, pretrained=True).eval()
+        for p in self.vit.parameters():
+            p.requires_grad_(False)
+
+    def forward(self, input_tensor: torch.Tensor) -> torch.Tensor | InferenceBatch:
+        input_tensor = input_tensor.type(self.memory_bank.dtype)
+        output_size = input_tensor.shape[-2:]
+
+        # CNN branch — inherited feature extraction + pooling + multi-scale concat
+        with torch.no_grad():
+            cnn_features = self.feature_extractor(input_tensor)
+        cnn_features = {layer: self.feature_pooler(feat) for layer, feat in cnn_features.items()}
+        cnn_embedding = self.generate_embedding(cnn_features)  # (B, 1536, H, W)
+
+        # ViT branch — frozen DeiT-Tiny patch tokens upsampled to CNN spatial dims
+        with torch.no_grad():
+            vit_out = self.vit.forward_features(input_tensor)      # (B, N_tokens, D)
+        n_prefix = getattr(self.vit, "num_prefix_tokens", 1)
+        patch_tokens = vit_out[:, n_prefix:, :]                    # (B, N_patches, 192)
+        n_side = int(patch_tokens.shape[1] ** 0.5)
+        patch_tokens = patch_tokens.reshape(patch_tokens.shape[0], n_side, n_side, -1)
+        patch_tokens = patch_tokens.permute(0, 3, 1, 2)            # (B, 192, n, n)
+        patch_tokens = F.interpolate(
+            patch_tokens, size=cnn_embedding.shape[-2:], mode="bilinear", align_corners=False
+        )                                                           # (B, 192, H, W)
+
+        # Fuse: (B, 1728, H, W)
+        embedding = torch.cat([cnn_embedding, patch_tokens], dim=1)
+
+        batch_size, _, width, height = embedding.shape
+        embedding = self.reshape_embedding(embedding)              # (B*H*W, 1728)
+
+        if self.training:
+            self.embedding_store.append(embedding)
+            return embedding
+
+        if self.memory_bank.size(0) == 0:
+            msg = "Memory bank is empty. Cannot provide anomaly scores."
+            raise ValueError(msg)
+
+        patch_scores, locations = self.nearest_neighbors(embedding=embedding, n_neighbors=1)
+        patch_scores = patch_scores.reshape((batch_size, -1))
+        locations = locations.reshape((batch_size, -1))
+        pred_score = self.compute_anomaly_score(patch_scores, locations, embedding)
+        patch_scores = patch_scores.reshape((batch_size, 1, width, height))
+        anomaly_map = self.anomaly_map_generator(patch_scores, output_size)
+
+        return InferenceBatch(pred_score=pred_score, anomaly_map=anomaly_map)
+
+
+class HybridCore(Patchcore):
+    """Patchcore Lightning module using dual-encoder HybridCoreModel."""
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.model = HybridCoreModel(
+            backbone=CNN_BACKBONE,
+            pre_trained=True,
+            layers=CNN_LAYERS,
+            num_neighbors=NUM_NEIGHBORS,
+        )
+
 
 # ── Experiment loop ───────────────────────────────────────────
 for ds_name, DataModule, categories, root in DATASETS:
@@ -65,13 +158,11 @@ for ds_name, DataModule, categories, root in DATASETS:
             print(f"  Dataset: {ds_name.upper()}  |  Category: {category}  |  Run {run+1}/{N_RUNS}")
             print(f"{'='*50}")
 
-            # (§5.1): "All images were resized into 256×256"
             datamodule = DataModule(
                 root=root,
                 category=category,
-                # (§5.1): "The batch size was 8" — reduced to 2 for small GPUs
-                train_batch_size=2,
-                eval_batch_size=2,
+                train_batch_size=32,
+                eval_batch_size=32,
             )
 
             image_auroc = AUROC(fields=["pred_score", "gt_label"], prefix="image_")
@@ -79,18 +170,21 @@ for ds_name, DataModule, categories, root in DATASETS:
             pixel_pro = AUPRO(fields=["anomaly_map", "gt_mask"], prefix="pixel_")
             evaluator = Evaluator(test_metrics=[image_auroc, pixel_auroc, pixel_pro])
 
-            # (§4, §5.1)
-            model = UniNet(
-                # (§5.1): "we used the publicly available WideResNet50 as backbone"
-                student_backbone="wide_resnet50_2",
-                teacher_backbone="wide_resnet50_2",
-                # anomalib default handles paper's λ=0.7, T=2, α=0.01, β=0.03
+            model = HybridCore(
+                backbone=CNN_BACKBONE,
+                layers=CNN_LAYERS,
+                pre_trained=True,
+                coreset_sampling_ratio=CORESET_RATIO,
+                num_neighbors=NUM_NEIGHBORS,
+                pre_processor=Patchcore.configure_pre_processor(
+                    image_size=(256, 256),
+                    center_crop_size=(224, 224),
+                ),
                 evaluator=evaluator,
                 visualizer=False,
             )
 
-            # (§5.1): AdamW, lr=5e-3/1e-6 student/teacher
-            engine = Engine(logger=False)
+            engine = Engine(max_epochs=1, logger=False)
             engine.fit(model=model, datamodule=datamodule)
 
             t0 = time.time()
@@ -127,7 +221,7 @@ def _fmt(mean: float, std: float) -> str:
     return f"{mean:10.1f}"
 
 # ── Final results table ───────────────────────────────────────
-out_path = "results/uninet_combined.txt"
+out_path = "results/hybridcore_combined.txt"
 
 COL = 12 if N_RUNS > 1 else 10
 W = 15 + COL * 4 + 3
@@ -135,8 +229,8 @@ HDR = f"{'Category':<15} {'Img AUROC':>{COL}} {'Pxl AUROC':>{COL}} {'PRO':>{COL}
 
 lines = []
 lines.append("=" * W)
-lines.append(f"  UniNet Results  (N={N_RUNS} run{'s' if N_RUNS > 1 else ''})")
-lines.append("  Backbone: WRN50  |  λ=0.7  |  T=2  |  α=0.01  |  β=0.03")
+lines.append(f"  HybridCore Results  (N={N_RUNS} run{'s' if N_RUNS > 1 else ''})")
+lines.append(f"  CNN: {CNN_BACKBONE} {CNN_LAYERS}  |  ViT: {VIT_NAME}  |  Coreset: {CORESET_RATIO*100:.0f}%")
 lines.append("=" * W)
 
 for ds_name, _, categories, _ in DATASETS:
