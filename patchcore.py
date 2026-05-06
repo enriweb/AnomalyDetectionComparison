@@ -24,6 +24,7 @@ import logging
 import os
 import statistics
 import sys
+import threading
 import time
 import warnings
 
@@ -71,6 +72,20 @@ def free_gpu() -> None:
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
+
+def _start_mem_sampler(samples: list, use_gpu: bool, interval: float = 0.05) -> threading.Event:
+    """Spawn a daemon thread that appends GPU or RSS memory samples every `interval` s."""
+    stop = threading.Event()
+    def _run():
+        proc = _psutil.Process(os.getpid()) if (not use_gpu and HAS_PSUTIL) else None
+        while not stop.is_set():
+            if use_gpu and torch.cuda.is_available():
+                samples.append(torch.cuda.memory_allocated() / 1e6)
+            elif proc is not None:
+                samples.append(proc.memory_info().rss / 1e6)
+            stop.wait(interval)
+    threading.Thread(target=_run, daemon=True).start()
+    return stop
 
 def vram_ok() -> bool:
     if not torch.cuda.is_available() or MAX_VRAM_GB <= 0:
@@ -238,9 +253,10 @@ for ds_idx, (ds_name, DataModule, categories, root) in enumerate(DATASETS, 1):
                         pass
 
                 # ── CPU inference: backbone on 1 image (warmup + avg of 5) ──
-                # Uses tracemalloc for peak memory (RSS delta is unreliable).
+                # tracemalloc → peak alloc; RSS sampler thread → mean memory.
                 inference_cpu_s = None
                 peak_cpu_mb = None
+                mean_cpu_mb = None
                 try:
                     import tracemalloc
                     print(f"  → Timing CPU inference (backbone, 1 image × 5 runs)...")
@@ -249,12 +265,16 @@ for ds_idx, (ds_name, DataModule, categories, root) in enumerate(DATASETS, 1):
                     _dev = next(_feat.parameters()).device
                     if str(_dev) != "cpu":
                         raise RuntimeError(f"Backbone still on {_dev} after .cpu()")
-                    _dummy_cpu = torch.randn(1, 3, 224, 224)  # already on CPU
+                    _dummy_cpu = torch.randn(1, 3, 224, 224)
                     # warmup — 3 passes to stabilise branch prediction / caches
                     for _ in range(3):
                         with torch.no_grad():
                             _feat(_dummy_cpu)
-                    # timed — average of 5 passes; tracemalloc tracks peak alloc
+                    # timed — avg 5 passes; RSS sampler runs concurrently for mean
+                    _cpu_rss_samples: list = []
+                    _cpu_stop = _start_mem_sampler(_cpu_rss_samples, use_gpu=False)
+                    _baseline_rss = (_psutil.Process(os.getpid()).memory_info().rss / 1e6
+                                     if HAS_PSUTIL else 0.0)
                     tracemalloc.start()
                     _times = []
                     for _ in range(5):
@@ -264,10 +284,16 @@ for ds_idx, (ds_name, DataModule, categories, root) in enumerate(DATASETS, 1):
                         _times.append(time.perf_counter() - _t)
                     _, _peak_bytes = tracemalloc.get_traced_memory()
                     tracemalloc.stop()
+                    _cpu_stop.set()
                     inference_cpu_s = round(statistics.mean(_times), 4)
                     peak_cpu_mb     = round(_peak_bytes / 1e6, 1)
+                    if _cpu_rss_samples:
+                        mean_cpu_mb = round(
+                            max(0.0, statistics.mean(_cpu_rss_samples) - _baseline_rss), 1
+                        )
                     print(f"  → CPU inference: {inference_cpu_s:.4f}s (avg 5 runs)"
-                          f"  |  peak CPU alloc: {peak_cpu_mb:.1f} MB")
+                          f"  |  peak: {peak_cpu_mb:.1f} MB"
+                          + (f"  |  mean: {mean_cpu_mb:.1f} MB" if mean_cpu_mb is not None else ""))
                     del _dummy_cpu
                     # restore backbone to GPU for the upcoming engine.test()
                     if torch.cuda.is_available():
@@ -275,18 +301,24 @@ for ds_idx, (ds_name, DataModule, categories, root) in enumerate(DATASETS, 1):
                 except Exception as _cpu_err:
                     print(f"  [WARN] CPU timing failed: {_cpu_err}")
 
-                # ── GPU inference with peak VRAM tracking ────────────
+                # ── GPU inference with peak + mean VRAM tracking ─────
                 print(f"  → Running inference on test set (GPU)...")
+                _gpu_samples: list = []
+                _gpu_stop = _start_mem_sampler(_gpu_samples, use_gpu=True)
                 if torch.cuda.is_available():
                     torch.cuda.reset_peak_memory_stats()
 
                 t0 = time.time()
                 test_results = engine.test(model=model, datamodule=datamodule)
                 elapsed_gpu = time.time() - t0
+                _gpu_stop.set()
 
                 peak_gpu_mb = 0.0
+                mean_gpu_mb = 0.0
                 if torch.cuda.is_available():
                     peak_gpu_mb = round(torch.cuda.max_memory_allocated() / 1e6, 1)
+                if _gpu_samples:
+                    mean_gpu_mb = round(statistics.mean(_gpu_samples), 1)
 
                 metrics = test_results[0]
                 img_auc  = metrics.get("image_AUROC", 0) * 100
@@ -298,7 +330,8 @@ for ds_idx, (ds_name, DataModule, categories, root) in enumerate(DATASETS, 1):
                 print(f"  → Results: Img AUROC {img_auc:.1f}% | Pxl AUROC {pxl_auc:.1f}%"
                       f" | AUPRO {pxl_pro:.1f}%"
                       + (f" | Img F1Max {img_f1:.1f}%" if img_f1 is not None else ""))
-                print(f"  → GPU inf: {elapsed_gpu:.3f}s  |  Peak GPU: {peak_gpu_mb:.1f} MB")
+                print(f"  → GPU inf: {elapsed_gpu:.3f}s  |  Peak GPU: {peak_gpu_mb:.1f} MB"
+                      f"  |  Mean GPU: {mean_gpu_mb:.1f} MB")
 
                 results[ds_name][category].append({
                     # ── Accuracy ──────────────────────────────────────
@@ -313,7 +346,9 @@ for ds_idx, (ds_name, DataModule, categories, root) in enumerate(DATASETS, 1):
                     "inference_gpu_s": elapsed_gpu,
                     "inference_cpu_s": inference_cpu_s,
                     "peak_gpu_mb":     peak_gpu_mb,
+                    "mean_gpu_mb":     mean_gpu_mb,
                     "peak_cpu_mb":     peak_cpu_mb,
+                    "mean_cpu_mb":     mean_cpu_mb,
                 })
 
                 with open(PROGRESS_FILE, "w") as f:
@@ -425,7 +460,8 @@ for ds_name, _, categories, _ in DATASETS:
     lines.append(f"\n--- {label} — Efficiency ---")
     HDR_E = (f"{'Category':<15} {'Params':>{CE}} {'FLOPs(M)':>{CE}}"
              f" {'GPU inf(s)':>{CE}} {'CPU inf(s)':>{CE}}"
-             f" {'PkGPU(MB)':>{CE}} {'PkCPU(MB)':>{CE}}")
+             f" {'PkGPU(MB)':>{CE}} {'MnGPU(MB)':>{CE}}"
+             f" {'PkCPU(MB)':>{CE}} {'MnCPU(MB)':>{CE}}")
     lines.append(HDR_E)
     lines.append("-" * len(HDR_E))
 
@@ -442,8 +478,11 @@ for ds_name, _, categories, _ in DATASETS:
         gi_  = _mean(runs, "inference_gpu_s")
         ci_  = _mean(runs, "inference_cpu_s")
         pgm_ = _mean(runs, "peak_gpu_mb")
+        mgm_ = _mean(runs, "mean_gpu_mb")
         pcm_ = _mean(runs, "peak_cpu_mb")
-        cat_eff[cat] = {"np": np_, "fl": fl_, "gpu": gi_, "cpu": ci_, "pgm": pgm_, "pcm": pcm_}
+        mcm_ = _mean(runs, "mean_cpu_mb")
+        cat_eff[cat] = {"np": np_, "fl": fl_, "gpu": gi_, "cpu": ci_,
+                        "pgm": pgm_, "mgm": mgm_, "pcm": pcm_, "mcm": mcm_}
         lines.append(
             f"{cat:<15}"
             f" {_fe(np_,  '{:,.0f}')}"
@@ -451,7 +490,9 @@ for ds_name, _, categories, _ in DATASETS:
             f" {_fe(gi_,  '{:.3f}')}"
             f" {_fe(ci_,  '{:.4f}')}"
             f" {_fe(pgm_, '{:.1f}')}"
+            f" {_fe(mgm_, '{:.1f}')}"
             f" {_fe(pcm_, '{:.1f}')}"
+            f" {_fe(mcm_, '{:.1f}')}"
         )
 
     if cat_eff:
@@ -467,7 +508,9 @@ for ds_name, _, categories, _ in DATASETS:
             f" {_fe(_avg_eff('gpu'), '{:.3f}')}"
             f" {_fe(_avg_eff('cpu'), '{:.4f}')}"
             f" {_fe(_avg_eff('pgm'), '{:.1f}')}"
+            f" {_fe(_avg_eff('mgm'), '{:.1f}')}"
             f" {_fe(_avg_eff('pcm'), '{:.1f}')}"
+            f" {_fe(_avg_eff('mcm'), '{:.1f}')}"
         )
 
 # ── Overall summary ───────────────────────────────────────────
