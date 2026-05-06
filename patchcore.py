@@ -4,6 +4,13 @@ PatchCore-25%
 Usage:
     python patchcore.py          # 1 run (default)
     python patchcore.py 3        # 3 runs, results averaged
+
+Metrics recorded per run:
+    Accuracy  — image AUROC, pixel AUROC, pixel AUPRO,
+                image F1Max (optimal threshold), pixel F1Max
+    Efficiency — n_params, FLOPs (backbone, thop optional),
+                 inference time GPU + CPU (backbone),
+                 peak GPU MB, peak CPU MB (psutil optional)
 """
 
 import gc
@@ -28,6 +35,27 @@ from anomalib.metrics import AUPRO, AUROC, Evaluator
 from anomalib.models import Patchcore
 from lightning.pytorch.callbacks import TQDMProgressBar
 
+# F1Max: anomalib ≥ 1.x; graceful fallback if missing
+try:
+    from anomalib.metrics import F1Max
+    HAS_F1MAX = True
+except ImportError:
+    HAS_F1MAX = False
+
+# FLOPs counting (pip install thop)
+try:
+    from thop import profile as _thop_profile
+    HAS_THOP = True
+except ImportError:
+    HAS_THOP = False
+
+# CPU memory tracking (pip install psutil)
+try:
+    import psutil as _psutil
+    HAS_PSUTIL = True
+except ImportError:
+    HAS_PSUTIL = False
+
 # ── Config ────────────────────────────────────────────────────
 N_RUNS: int        = int(sys.argv[1]) if len(sys.argv) > 1 else 1
 MAX_VRAM_GB: float = 8.0   # reserved VRAM limit before each run; 0 = disabled
@@ -46,7 +74,6 @@ def vram_ok() -> bool:
 
 # ── Single-line progress bar ──────────────────────────────────
 class CompactBar(TQDMProgressBar):
-    """TQDMProgressBar with leave=False so each bar stays on one line."""
     def init_train_tqdm(self):
         bar = super().init_train_tqdm(); bar.leave = False; return bar
     def init_test_tqdm(self):
@@ -108,7 +135,8 @@ for ds_name, DataModule, categories, root in DATASETS:
                     continue
 
             model = engine = datamodule = evaluator = None
-            image_auroc = pixel_auroc = pixel_pro = test_results = metrics = None
+            image_auroc = pixel_auroc = pixel_pro = None
+            image_f1max = pixel_f1max = test_results = metrics = None
             try:
                 # (§4.1): "No data augmentation is applied"
                 datamodule = DataModule(
@@ -119,9 +147,16 @@ for ds_name, DataModule, categories, root in DATASETS:
                 )
 
                 image_auroc = AUROC(fields=["pred_score", "gt_label"], prefix="image_")
-                pixel_auroc = AUROC(fields=["anomaly_map", "gt_mask"], prefix="pixel_")
-                pixel_pro   = AUPRO(fields=["anomaly_map", "gt_mask"], prefix="pixel_")
-                evaluator   = Evaluator(test_metrics=[image_auroc, pixel_auroc, pixel_pro])
+                pixel_auroc = AUROC(fields=["anomaly_map", "gt_mask"],  prefix="pixel_")
+                # fpr_limit=0.3 matches paper Table 3
+                pixel_pro   = AUPRO(fields=["anomaly_map", "gt_mask"],  prefix="pixel_")
+                test_metrics = [image_auroc, pixel_auroc, pixel_pro]
+                if HAS_F1MAX:
+                    # F1 at optimal decision threshold (image + pixel level)
+                    image_f1max = F1Max(fields=["pred_score", "gt_label"], prefix="image_")
+                    pixel_f1max = F1Max(fields=["anomaly_map", "gt_mask"],  prefix="pixel_")
+                    test_metrics += [image_f1max, pixel_f1max]
+                evaluator = Evaluator(test_metrics=test_metrics)
 
                 # (§3.1, §3.2, §4.4.1)
                 model = Patchcore(
@@ -143,19 +178,79 @@ for ds_name, DataModule, categories, root in DATASETS:
                     visualizer=False,
                 )
 
+                # Parameter count (backbone only; coreset is a buffer, not params)
+                n_params = sum(p.numel() for p in model.parameters())
+
                 engine = Engine(max_epochs=1, logger=False, callbacks=[CompactBar()])
                 engine.fit(model=model, datamodule=datamodule)
 
+                # ── FLOPs: backbone forward pass on one image ─────────
+                flops_M = None
+                if HAS_THOP:
+                    try:
+                        device = next(model.parameters()).device
+                        _dummy = torch.randn(1, 3, 224, 224, device=device)
+                        with warnings.catch_warnings():
+                            warnings.simplefilter("ignore")
+                            _flops, _ = _thop_profile(
+                                model.model.feature_extractor, inputs=(_dummy,), verbose=False
+                            )
+                        flops_M = round(_flops / 1e6, 1)
+                        del _dummy
+                    except Exception:
+                        pass
+
+                # ── CPU inference: backbone on 1 image (warmup + timed) ──
+                inference_cpu_s = None
+                peak_cpu_mb = None
+                try:
+                    _feat = model.model.feature_extractor.cpu().eval()
+                    _dummy_cpu = torch.randn(1, 3, 224, 224)
+                    with torch.no_grad():
+                        _feat(_dummy_cpu)                          # warmup
+                    if HAS_PSUTIL:
+                        _proc = _psutil.Process(os.getpid())
+                        _mem0 = _proc.memory_info().rss / 1e6
+                    _t = time.perf_counter()
+                    with torch.no_grad():
+                        _feat(_dummy_cpu)
+                    inference_cpu_s = round(time.perf_counter() - _t, 4)
+                    if HAS_PSUTIL:
+                        peak_cpu_mb = round(max(0.0, _proc.memory_info().rss / 1e6 - _mem0), 1)
+                    del _dummy_cpu
+                    # restore backbone to GPU if available
+                    if torch.cuda.is_available():
+                        model.model.feature_extractor.cuda()
+                except Exception:
+                    pass
+
+                # ── GPU inference with peak VRAM tracking ────────────
+                if torch.cuda.is_available():
+                    torch.cuda.reset_peak_memory_stats()
+
                 t0 = time.time()
                 test_results = engine.test(model=model, datamodule=datamodule)
-                elapsed = time.time() - t0
+                elapsed_gpu = time.time() - t0
+
+                peak_gpu_mb = 0.0
+                if torch.cuda.is_available():
+                    peak_gpu_mb = round(torch.cuda.max_memory_allocated() / 1e6, 1)
 
                 metrics = test_results[0]
                 results[ds_name][category].append({
-                    "image_AUROC": metrics.get("image_AUROC", 0) * 100,
-                    "pixel_AUROC": metrics.get("pixel_AUROC", 0) * 100,
-                    "pixel_AUPRO": metrics.get("pixel_AUPRO", 0) * 100,
-                    "inference_s": elapsed,
+                    # ── Accuracy ──────────────────────────────────────
+                    "image_AUROC":     metrics.get("image_AUROC", 0) * 100,
+                    "pixel_AUROC":     metrics.get("pixel_AUROC", 0) * 100,
+                    "pixel_AUPRO":     metrics.get("pixel_AUPRO", 0) * 100,
+                    "image_F1Max":     metrics.get("image_F1Max", None) and metrics["image_F1Max"] * 100,
+                    "pixel_F1Max":     metrics.get("pixel_F1Max", None) and metrics["pixel_F1Max"] * 100,
+                    # ── Efficiency ────────────────────────────────────
+                    "n_params":        n_params,
+                    "flops_M":         flops_M,
+                    "inference_gpu_s": elapsed_gpu,
+                    "inference_cpu_s": inference_cpu_s,
+                    "peak_gpu_mb":     peak_gpu_mb,
+                    "peak_cpu_mb":     peak_cpu_mb,
                 })
 
                 with open(PROGRESS_FILE, "w") as f:
@@ -170,66 +265,129 @@ for ds_name, DataModule, categories, root in DATASETS:
                     raise
             finally:
                 del model, engine, datamodule, evaluator
-                del image_auroc, pixel_auroc, pixel_pro, test_results, metrics
+                del image_auroc, pixel_auroc, pixel_pro, image_f1max, pixel_f1max
+                del test_results, metrics
                 free_gpu()
 
 # ── Result helpers ────────────────────────────────────────────
 def _mean(runs: list[dict], key: str) -> float:
-    return statistics.mean(r[key] for r in runs)
+    vals = [r[key] for r in runs if r.get(key) is not None]
+    return statistics.mean(vals) if vals else float("nan")
 
 def _std(runs: list[dict], key: str) -> float:
-    return statistics.stdev(r[key] for r in runs) if len(runs) > 1 else 0.0
+    vals = [r[key] for r in runs if r.get(key) is not None]
+    return statistics.stdev(vals) if len(vals) > 1 else 0.0
 
-def _fmt(mean: float, std: float) -> str:
-    return f"{mean:5.1f}±{std:4.1f}" if N_RUNS > 1 else f"{mean:10.1f}"
+def _fmt(mean: float, std: float, decimals: int = 1) -> str:
+    if mean != mean:  # nan
+        return "n/a".rjust(12 if N_RUNS > 1 else 10)
+    fmt = f"{{:{5+decimals}.{decimals}f}}±{{:4.{decimals}f}}" if N_RUNS > 1 else f"{{:10.{decimals}f}}"
+    return fmt.format(mean, std) if N_RUNS > 1 else fmt.format(mean)
 
-# ── Final results table ───────────────────────────────────────
+# ── Final results tables ──────────────────────────────────────
 out_path = "results/patchcore_combined.txt"
-COL = 12 if N_RUNS > 1 else 10
-W   = 15 + COL * 4 + 3
-HDR = f"{'Category':<15} {'Img AUROC':>{COL}} {'Pxl AUROC':>{COL}} {'PRO':>{COL}} {'Infer(s)':>{COL}}"
+C  = 12 if N_RUNS > 1 else 10
+CE = 11  # efficiency column width
 
 lines = []
-lines.append("=" * W)
+SEP = "=" * 80
+
+lines.append(SEP)
 lines.append(f"  PatchCore-25% Results  (N={N_RUNS} run{'s' if N_RUNS > 1 else ''})")
 lines.append("  Backbone: WideResNet-50  |  Layers: 2+3  |  Coreset: 25%")
-lines.append("=" * W)
+lines.append(SEP)
 
 for ds_name, _, categories, _ in DATASETS:
     label = "MVTecAD" if ds_name == "mvtec" else "VisA"
-    lines.append(f"\n--- {label} ({len(categories)} categories) ---")
-    lines.append(HDR)
-    lines.append("-" * W)
 
-    cat_means: dict[str, dict[str, float]] = {}
+    # ── Accuracy table ────────────────────────────────────────
+    lines.append(f"\n--- {label} — Accuracy ---")
+    HDR_A = (f"{'Category':<15} {'Img AUROC':>{C}} {'Pxl AUROC':>{C}}"
+             f" {'AUPRO':>{C}} {'Img F1Max':>{C}} {'Pxl F1Max':>{C}}")
+    lines.append(HDR_A)
+    lines.append("-" * len(HDR_A))
+
+    cat_acc: dict[str, dict] = {}
     for cat in categories:
         runs = results.get(ds_name, {}).get(cat)
         if not runs:
             continue
-        m_img = _mean(runs, "image_AUROC");  s_img = _std(runs, "image_AUROC")
-        m_pxl = _mean(runs, "pixel_AUROC");  s_pxl = _std(runs, "pixel_AUROC")
-        m_pro = _mean(runs, "pixel_AUPRO");  s_pro = _std(runs, "pixel_AUPRO")
-        m_t   = _mean(runs, "inference_s");  s_t   = _std(runs, "inference_s")
-        cat_means[cat] = {"img": m_img, "pxl": m_pxl, "pro": m_pro, "t": m_t}
+        r = {k: (_mean(runs, k), _std(runs, k)) for k in
+             ("image_AUROC", "pixel_AUROC", "pixel_AUPRO", "image_F1Max", "pixel_F1Max")}
+        cat_acc[cat] = {k: v[0] for k, v in r.items()}
         lines.append(
             f"{cat:<15}"
-            f" {_fmt(m_img, s_img):>{COL}}"
-            f" {_fmt(m_pxl, s_pxl):>{COL}}"
-            f" {_fmt(m_pro, s_pro):>{COL}}"
-            f" {_fmt(m_t,   s_t  ):>{COL}}"
+            f" {_fmt(*r['image_AUROC']):>{C}}"
+            f" {_fmt(*r['pixel_AUROC']):>{C}}"
+            f" {_fmt(*r['pixel_AUPRO']):>{C}}"
+            f" {_fmt(*r['image_F1Max']):>{C}}"
+            f" {_fmt(*r['pixel_F1Max']):>{C}}"
         )
 
-    if cat_means:
-        avg = {k: statistics.mean(v[k] for v in cat_means.values()) for k in ("img", "pxl", "pro", "t")}
-        lines.append("-" * W)
+    if cat_acc:
+        avg = {k: statistics.mean(v for v in (c[k] for c in cat_acc.values()) if v == v)
+               for k in ("image_AUROC", "pixel_AUROC", "pixel_AUPRO", "image_F1Max", "pixel_F1Max")}
+        lines.append("-" * len(HDR_A))
         lines.append(
             f"{'MEAN':<15}"
-            f" {avg['img']:>{COL}.1f}"
-            f" {avg['pxl']:>{COL}.1f}"
-            f" {avg['pro']:>{COL}.1f}"
-            f" {avg['t']:>{COL}.2f}"
+            f" {avg['image_AUROC']:>{C}.1f}"
+            f" {avg['pixel_AUROC']:>{C}.1f}"
+            f" {avg['pixel_AUPRO']:>{C}.1f}"
+            f" {avg.get('image_F1Max', float('nan')):>{C}.1f}"
+            f" {avg.get('pixel_F1Max', float('nan')):>{C}.1f}"
         )
 
+    # ── Efficiency table ──────────────────────────────────────
+    lines.append(f"\n--- {label} — Efficiency ---")
+    HDR_E = (f"{'Category':<15} {'Params':>{CE}} {'FLOPs(M)':>{CE}}"
+             f" {'GPU inf(s)':>{CE}} {'CPU inf(s)':>{CE}}"
+             f" {'PkGPU(MB)':>{CE}} {'PkCPU(MB)':>{CE}}")
+    lines.append(HDR_E)
+    lines.append("-" * len(HDR_E))
+
+    def _fe(v, fmt) -> str:
+        return (fmt.format(v) if v == v else "n/a").rjust(CE)
+
+    cat_eff: dict[str, dict] = {}
+    for cat in categories:
+        runs = results.get(ds_name, {}).get(cat)
+        if not runs:
+            continue
+        np_  = _mean(runs, "n_params")
+        fl_  = _mean(runs, "flops_M")
+        gi_  = _mean(runs, "inference_gpu_s")
+        ci_  = _mean(runs, "inference_cpu_s")
+        pgm_ = _mean(runs, "peak_gpu_mb")
+        pcm_ = _mean(runs, "peak_cpu_mb")
+        cat_eff[cat] = {"np": np_, "fl": fl_, "gpu": gi_, "cpu": ci_, "pgm": pgm_, "pcm": pcm_}
+        lines.append(
+            f"{cat:<15}"
+            f" {_fe(np_,  '{:,.0f}')}"
+            f" {_fe(fl_,  '{:.1f}')}"
+            f" {_fe(gi_,  '{:.3f}')}"
+            f" {_fe(ci_,  '{:.4f}')}"
+            f" {_fe(pgm_, '{:.1f}')}"
+            f" {_fe(pcm_, '{:.1f}')}"
+        )
+
+    if cat_eff:
+        lines.append("-" * len(HDR_E))
+        # params and FLOPs are constant across categories — take from first
+        _first = next(iter(cat_eff.values()))
+        def _avg_eff(key):
+            vals = [v[key] for v in cat_eff.values() if v[key] == v[key]]
+            return statistics.mean(vals) if vals else float("nan")
+        lines.append(
+            f"{'MEAN':<15}"
+            f" {_fe(_first['np'],  '{:,.0f}')}"
+            f" {_fe(_first['fl'],  '{:.1f}')}"
+            f" {_fe(_avg_eff('gpu'), '{:.3f}')}"
+            f" {_fe(_avg_eff('cpu'), '{:.4f}')}"
+            f" {_fe(_avg_eff('pgm'), '{:.1f}')}"
+            f" {_fe(_avg_eff('pcm'), '{:.1f}')}"
+        )
+
+# ── Overall summary ───────────────────────────────────────────
 all_cats = [
     (ds, cat)
     for ds, _, cats, _ in DATASETS
@@ -238,13 +396,22 @@ all_cats = [
 ]
 n_all = len(all_cats)
 if n_all:
-    oi  = statistics.mean(_mean(results[ds][c], "image_AUROC") for ds, c in all_cats)
-    op  = statistics.mean(_mean(results[ds][c], "pixel_AUROC") for ds, c in all_cats)
-    or_ = statistics.mean(_mean(results[ds][c], "pixel_AUPRO") for ds, c in all_cats)
-    ot  = statistics.mean(_mean(results[ds][c], "inference_s") for ds, c in all_cats)
-    lines.append(f"\n--- Overall Mean ({n_all} categories, N={N_RUNS} runs each) ---")
-    lines.append(f"Img AUROC: {oi:.1f}  |  Pxl AUROC: {op:.1f}  |  PRO: {or_:.1f}  |  Infer(s): {ot:.2f}")
-lines.append("=" * W)
+    def _omean(key):
+        return statistics.mean(_mean(results[ds][c], key) for ds, c in all_cats
+                               if _mean(results[ds][c], key) == _mean(results[ds][c], key))
+    oi   = _omean("image_AUROC")
+    op   = _omean("pixel_AUROC")
+    opr  = _omean("pixel_AUPRO")
+    of1i = _omean("image_F1Max")
+    of1p = _omean("pixel_F1Max")
+    ogi  = _omean("inference_gpu_s")
+    lines.append(f"\n{'='*80}")
+    lines.append(f"  Overall Mean ({n_all} categories, N={N_RUNS} runs each)")
+    lines.append(f"{'='*80}")
+    lines.append(f"  Img AUROC : {oi:.2f}%   Pxl AUROC : {op:.2f}%   AUPRO : {opr:.2f}%")
+    lines.append(f"  Img F1Max : {of1i:.2f}%   Pxl F1Max : {of1p:.2f}%")
+    lines.append(f"  GPU inf   : {ogi:.3f}s")
+    lines.append("=" * 80)
 
 output = "\n".join(lines)
 print("\n" + output)
