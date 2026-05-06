@@ -50,6 +50,47 @@ try:
 except ImportError:
     HAS_F1MAX = False
 
+# FNR = FN/(FN+TP) at the F1-optimal threshold (lower is better)
+try:
+    from torchmetrics import Metric as _TMMetric
+
+    class FNR(_TMMetric):
+        """False Negative Rate at the threshold that maximises F1."""
+        higher_is_better: bool = False
+        full_state_update: bool = False
+
+        def __init__(self, fields: list[str], prefix: str = "", num_thresh: int = 200):
+            super().__init__()
+            self.fields = fields
+            self.prefix = prefix
+            self._num_thresh = num_thresh
+            self.add_state("preds",  default=[], dist_reduce_fx="cat")
+            self.add_state("labels", default=[], dist_reduce_fx="cat")
+
+        def update(self, **kwargs) -> None:
+            self.preds.append(kwargs[self.fields[0]].float().detach().flatten())
+            self.labels.append(kwargs[self.fields[1]].float().detach().flatten())
+
+        def compute(self) -> torch.Tensor:
+            p  = torch.cat(self.preds)
+            lb = torch.cat(self.labels).long()
+            ts = torch.linspace(p.min(), p.max(), self._num_thresh, device=p.device)
+            best_fnr, best_f1 = torch.tensor(1.0, device=p.device), -1.0
+            for t in ts:
+                pb = (p >= t).long()
+                tp = ((pb == 1) & (lb == 1)).sum().float()
+                fp = ((pb == 1) & (lb == 0)).sum().float()
+                fn = ((pb == 0) & (lb == 1)).sum().float()
+                f1 = 2 * tp / (2 * tp + fp + fn + 1e-8)
+                if f1.item() > best_f1:
+                    best_f1 = f1.item()
+                    best_fnr = fn / (fn + tp + 1e-8)
+            return best_fnr
+
+    HAS_FNR = True
+except Exception:
+    HAS_FNR = False
+
 # FLOPs counting (pip install thop)
 try:
     from thop import profile as _thop_profile
@@ -152,6 +193,7 @@ print(f"  Max VRAM limit    : {MAX_VRAM_GB:.1f} GB  ({'disabled' if MAX_VRAM_GB 
 print(f"  FLOPs (thop)      : {'available' if HAS_THOP else 'not installed — skipped'}")
 print(f"  CPU mem (psutil)  : {'available' if HAS_PSUTIL else 'not installed — skipped'}")
 print(f"  F1Max metric      : {'available' if HAS_F1MAX else 'not in this anomalib version — skipped'}")
+print(f"  FNR metric        : {'available' if HAS_FNR else 'torchmetrics missing — skipped'}")
 gpu_info = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU only"
 print(f"  Device            : {gpu_info}")
 print("=" * 60)
@@ -201,7 +243,7 @@ for ds_idx, (ds_name, DataModule, categories, root) in enumerate(DATASETS, 1):
 
             model = engine = datamodule = evaluator = None
             image_auroc = pixel_auroc = pixel_pro = None
-            image_f1max = pixel_f1max = test_results = metrics = None
+            image_f1max = pixel_f1max = image_fnr = pixel_fnr = test_results = metrics = None
             try:
                 print(f"  → Loading datamodule...")
                 # Same preprocessing as PatchCore paper (§4.1)
@@ -220,6 +262,10 @@ for ds_idx, (ds_name, DataModule, categories, root) in enumerate(DATASETS, 1):
                     image_f1max = F1Max(fields=["pred_score", "gt_label"], prefix="image_")
                     pixel_f1max = F1Max(fields=["anomaly_map", "gt_mask"],  prefix="pixel_")
                     test_metrics += [image_f1max, pixel_f1max]
+                if HAS_FNR:
+                    image_fnr = FNR(fields=["pred_score", "gt_label"], prefix="image_")
+                    pixel_fnr = FNR(fields=["anomaly_map", "gt_mask"],  prefix="pixel_")
+                    test_metrics += [image_fnr, pixel_fnr]
                 evaluator = Evaluator(test_metrics=test_metrics)
 
                 print(f"  → Building model ({BACKBONE} backbone)...")
@@ -335,10 +381,13 @@ for ds_idx, (ds_name, DataModule, categories, root) in enumerate(DATASETS, 1):
                 pxl_pro  = metrics.get("pixel_AUPRO", 0) * 100
                 img_f1   = (metrics["image_F1Max"] * 100) if metrics.get("image_F1Max") is not None else None
                 pxl_f1   = (metrics["pixel_F1Max"] * 100) if metrics.get("pixel_F1Max") is not None else None
+                img_fnr  = (metrics["image_FNR"] * 100) if metrics.get("image_FNR") is not None else None
+                pxl_fnr  = (metrics["pixel_FNR"] * 100) if metrics.get("pixel_FNR") is not None else None
 
                 print(f"  → Results: Img AUROC {img_auc:.1f}% | Pxl AUROC {pxl_auc:.1f}%"
                       f" | AUPRO {pxl_pro:.1f}%"
-                      + (f" | Img F1Max {img_f1:.1f}%" if img_f1 is not None else ""))
+                      + (f" | F1Max {img_f1:.1f}%" if img_f1 is not None else "")
+                      + (f" | ImgFNR {img_fnr:.1f}%" if img_fnr is not None else ""))
                 print(f"  → GPU inf: {elapsed_gpu:.3f}s  |  Peak GPU: {peak_gpu_mb:.1f} MB"
                       f"  |  Mean GPU: {mean_gpu_mb:.1f} MB")
 
@@ -349,6 +398,8 @@ for ds_idx, (ds_name, DataModule, categories, root) in enumerate(DATASETS, 1):
                     "pixel_AUPRO":     pxl_pro,
                     "image_F1Max":     img_f1,
                     "pixel_F1Max":     pxl_f1,
+                    "image_FNR":       img_fnr,
+                    "pixel_FNR":       pxl_fnr,
                     # ── Efficiency ────────────────────────────────────
                     "n_params":        n_params,
                     "flops_M":         flops_M,
@@ -375,7 +426,7 @@ for ds_idx, (ds_name, DataModule, categories, root) in enumerate(DATASETS, 1):
                     raise
             finally:
                 del model, engine, datamodule, evaluator
-                del image_auroc, pixel_auroc, pixel_pro, image_f1max, pixel_f1max
+                del image_auroc, pixel_auroc, pixel_pro, image_f1max, pixel_f1max, image_fnr, pixel_fnr
                 del test_results, metrics
                 free_gpu()
 
@@ -431,7 +482,8 @@ for ds_name, _, categories, _ in DATASETS:
     # ── Accuracy table ────────────────────────────────────────
     lines.append(f"\n--- {label} — Accuracy ---")
     HDR_A = (f"{'Category':<15} {'Img AUROC':>{C}} {'Pxl AUROC':>{C}}"
-             f" {'AUPRO':>{C}} {'Img F1Max':>{C}} {'Pxl F1Max':>{C}}")
+             f" {'AUPRO':>{C}} {'Img F1Max':>{C}} {'Pxl F1Max':>{C}}"
+             f" {'Img FNR':>{C}} {'Pxl FNR':>{C}}")
     lines.append(HDR_A)
     lines.append("-" * len(HDR_A))
 
@@ -441,7 +493,8 @@ for ds_name, _, categories, _ in DATASETS:
         if not runs:
             continue
         r = {k: (_mean(runs, k), _std(runs, k)) for k in
-             ("image_AUROC", "pixel_AUROC", "pixel_AUPRO", "image_F1Max", "pixel_F1Max")}
+             ("image_AUROC", "pixel_AUROC", "pixel_AUPRO", "image_F1Max", "pixel_F1Max",
+              "image_FNR", "pixel_FNR")}
         cat_acc[cat] = {k: v[0] for k, v in r.items()}
         lines.append(
             f"{cat:<15}"
@@ -450,11 +503,14 @@ for ds_name, _, categories, _ in DATASETS:
             f" {_fmt(*r['pixel_AUPRO']):>{C}}"
             f" {_fmt(*r['image_F1Max']):>{C}}"
             f" {_fmt(*r['pixel_F1Max']):>{C}}"
+            f" {_fmt(*r['image_FNR']):>{C}}"
+            f" {_fmt(*r['pixel_FNR']):>{C}}"
         )
 
     if cat_acc:
         avg = {k: statistics.mean(v for v in (c[k] for c in cat_acc.values()) if v == v)
-               for k in ("image_AUROC", "pixel_AUROC", "pixel_AUPRO", "image_F1Max", "pixel_F1Max")}
+               for k in ("image_AUROC", "pixel_AUROC", "pixel_AUPRO", "image_F1Max", "pixel_F1Max",
+                         "image_FNR", "pixel_FNR")}
         lines.append("-" * len(HDR_A))
         lines.append(
             f"{'MEAN':<15}"
@@ -463,6 +519,8 @@ for ds_name, _, categories, _ in DATASETS:
             f" {avg['pixel_AUPRO']:>{C}.1f}"
             f" {avg.get('image_F1Max', float('nan')):>{C}.1f}"
             f" {avg.get('pixel_F1Max', float('nan')):>{C}.1f}"
+            f" {avg.get('image_FNR', float('nan')):>{C}.1f}"
+            f" {avg.get('pixel_FNR', float('nan')):>{C}.1f}"
         )
 
     # ── Efficiency table ──────────────────────────────────────
@@ -538,14 +596,17 @@ if n_all:
     oi   = _omean("image_AUROC")
     op   = _omean("pixel_AUROC")
     opr  = _omean("pixel_AUPRO")
-    of1i = _omean("image_F1Max")
-    of1p = _omean("pixel_F1Max")
-    ogi  = _omean("inference_gpu_s")
+    of1i  = _omean("image_F1Max")
+    of1p  = _omean("pixel_F1Max")
+    ofnri = _omean("image_FNR")
+    ofnrp = _omean("pixel_FNR")
+    ogi   = _omean("inference_gpu_s")
     lines.append(f"\n{'='*80}")
     lines.append(f"  Overall Mean ({n_all} categories, N={N_RUNS} runs each)")
     lines.append(f"{'='*80}")
     lines.append(f"  Img AUROC : {oi:.2f}%   Pxl AUROC : {op:.2f}%   AUPRO : {opr:.2f}%")
     lines.append(f"  Img F1Max : {of1i:.2f}%   Pxl F1Max : {of1p:.2f}%")
+    lines.append(f"  Img FNR   : {ofnri:.2f}%   Pxl FNR   : {ofnrp:.2f}%")
     lines.append(f"  GPU inf   : {ogi:.3f}s")
 
 # ── OOM section in results file ───────────────────────────────
