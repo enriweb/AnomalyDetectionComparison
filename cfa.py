@@ -252,7 +252,8 @@ for ds_idx, (ds_name, DataModule, categories, root) in enumerate(DATASETS, 1):
                 evaluator = Evaluator(test_metrics=test_metrics)
 
                 print(f"  → Building model (WRN50 backbone)...")
-                # (§3, §4.1)
+                # (§3, §4.1) — anomalib defaults match paper §4.1:
+                #   AdamW, lr=1e-3, weight_decay=5e-4, amsgrad=True
                 model = Cfa(
                     # (§4.1): "All CNNs pretrained with ImageNet" / (Table 5): WRN50-2
                     backbone="wide_resnet50_2",

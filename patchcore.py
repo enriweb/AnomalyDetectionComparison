@@ -262,6 +262,8 @@ for ds_idx, (ds_name, DataModule, categories, root) in enumerate(DATASETS, 1):
                     # (§3.2, Table 1): PatchCore-25% = 25% coreset subsampling
                     coreset_sampling_ratio=0.25,
                     # (Eq.7): num_neighbors b for re-weighting (anomalib default=9)
+                    # Paper's NN parameter p=3 is internal to coreset scoring and not
+                    # surfaced by anomalib 2.3.2 (uses Eq.7 b=9 only).
                     num_neighbors=9,
                     # (§4.1): "images are resized and center cropped to 256×256 and 224×224"
                     pre_processor=Patchcore.configure_pre_processor(

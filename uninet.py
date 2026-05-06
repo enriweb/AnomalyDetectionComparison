@@ -232,9 +232,9 @@ for ds_idx, (ds_name, DataModule, categories, root) in enumerate(DATASETS, 1):
                 datamodule = DataModule(
                     root=root,
                     category=category,
-                    # (§5.1): "The batch size was 8" — reduced to 2 for small GPUs
-                    train_batch_size=2,
-                    eval_batch_size=2,
+                    # (§5.1): "The batch size was 8" — paper-faithful (OOM-skip handles low VRAM)
+                    train_batch_size=8,
+                    eval_batch_size=8,
                 )
 
                 image_auroc = AUROC(fields=["pred_score", "gt_label"], prefix="image_")
@@ -257,7 +257,10 @@ for ds_idx, (ds_name, DataModule, categories, root) in enumerate(DATASETS, 1):
                     # (§5.1): "we used the publicly available WideResNet50 as backbone"
                     student_backbone="wide_resnet50_2",
                     teacher_backbone="wide_resnet50_2",
-                    # anomalib default handles paper's λ=0.7, T=2, α=0.01, β=0.03
+                    # (§5.1): "T=2" — anomalib's UniNet defaults T=0.1, must override.
+                    # λ=0.7 already matches anomalib's UniNetLoss default.
+                    # α=0.01, β=0.03 not exposed by anomalib's UniNetLoss API (deviation).
+                    temperature=2.0,
                     evaluator=evaluator,
                     visualizer=False,
                 )
@@ -265,9 +268,11 @@ for ds_idx, (ds_name, DataModule, categories, root) in enumerate(DATASETS, 1):
                 n_params = sum(p.numel() for p in model.parameters())
                 print(f"  → Parameters: {n_params:,}")
 
-                print(f"  → Training...")
-                # (§5.1): AdamW, lr=5e-3/1e-6 student/teacher
-                engine = Engine(logger=False, callbacks=[CompactBar()])
+                print(f"  → Training (max_epochs=500)...")
+                # (§5.1): AdamW, lr=5e-3 student / 1e-6 teacher (anomalib default).
+                # (§5.1): MVTec trains 500 epochs; required for the MultiStepLR
+                # schedule (anomalib steps at 80% of training).
+                engine = Engine(max_epochs=500, logger=False, callbacks=[CompactBar()])
                 engine.fit(model=model, datamodule=datamodule)
                 print(f"  → Training complete.")
 

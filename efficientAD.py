@@ -275,6 +275,10 @@ for ds_idx, (ds_name, DataModule, categories, root) in enumerate(DATASETS, 1):
                     # (§3.1): PDN has no padding — receptive field exactly 33×33
                     padding=False,
                     pad_maps=True,
+                    # (§3.1): "we resize all input images to 256×256 pixels"
+                    pre_processor=EfficientAd.configure_pre_processor(
+                        image_size=(256, 256),
+                    ),
                     evaluator=evaluator,
                     visualizer=False,
                 )

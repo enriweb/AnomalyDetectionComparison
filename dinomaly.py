@@ -248,9 +248,9 @@ for ds_idx, (ds_name, DataModule, categories, root) in enumerate(DATASETS, 1):
                 datamodule = DataModule(
                     root=root,
                     category=category,
-                    # (§4.1): "batch size of 16" — reduced for small GPUs
-                    train_batch_size=2,
-                    eval_batch_size=2,
+                    # (§4.1): paper batch=16 (OOM-skip handles low VRAM)
+                    train_batch_size=16,
+                    eval_batch_size=16,
                 )
 
                 image_auroc = AUROC(fields=["pred_score", "gt_label"], prefix="image_")
@@ -283,6 +283,12 @@ for ds_idx, (ds_name, DataModule, categories, root) in enumerate(DATASETS, 1):
                     fuse_layer_decoder=None,
                     # (§3.1): keep class token
                     remove_class_token=False,
+                    # (§4.1): resize 448×448, center-crop 392 (paper-faithful).
+                    # Low-VRAM fallback: image_size=(224,224), crop_size=196.
+                    pre_processor=Dinomaly.configure_pre_processor(
+                        image_size=(448, 448),
+                        crop_size=392,
+                    ),
                     evaluator=evaluator,
                     visualizer=False,
                 )
@@ -290,9 +296,10 @@ for ds_idx, (ds_name, DataModule, categories, root) in enumerate(DATASETS, 1):
                 n_params = sum(p.numel() for p in model.parameters())
                 print(f"  → Parameters: {n_params:,}")
 
-                print(f"  → Training...")
-                # (§4.1): "trained for 10,000 iterations (steps) on MVTec-AD"
-                engine = Engine(logger=False, callbacks=[CompactBar()])
+                print(f"  → Training (max_steps=5000)...")
+                # (§4.1): "trained for 5000 iterations (steps) on MVTec-AD"
+                # (anomalib's Dinomaly default also 5000; setting explicitly).
+                engine = Engine(max_steps=5000, logger=False, callbacks=[CompactBar()])
                 engine.fit(model=model, datamodule=datamodule)
                 print(f"  → Training complete.")
 
