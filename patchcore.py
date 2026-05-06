@@ -11,6 +11,11 @@ Metrics recorded per run:
     Efficiency — n_params, FLOPs (backbone, thop optional),
                  inference time GPU + CPU (backbone),
                  peak GPU MB, peak CPU MB (psutil optional)
+
+Progress is checkpointed to results/patchcore_progress.json after every
+completed run. On normal exit the checkpoint is deleted so the next
+invocation starts fresh. On crash / OOM the checkpoint survives and the
+next invocation auto-resumes from where it left off.
 """
 
 import gc
@@ -27,7 +32,7 @@ warnings.filterwarnings("ignore")
 os.environ["PYTHONWARNINGS"] = "ignore"
 for _log in ("lightning", "lightning.pytorch", "anomalib", "torchvision", "torch"):
     logging.getLogger(_log).setLevel(logging.ERROR)
-
+print("Importing torch-related libraries")
 import torch
 from anomalib.data import MVTecAD, Visa
 from anomalib.engine import Engine
@@ -58,8 +63,8 @@ except ImportError:
 
 # ── Config ────────────────────────────────────────────────────
 N_RUNS: int        = int(sys.argv[1]) if len(sys.argv) > 1 else 1
-MAX_VRAM_GB: float = 8.0   # reserved VRAM limit before each run; 0 = disabled
-
+MAX_VRAM_GB: float = 0   # reserved VRAM limit before each run; 0 = disabled
+torch.set_float32_matmul_precision('high')
 # ── GPU helpers ───────────────────────────────────────────────
 def free_gpu() -> None:
     gc.collect()
@@ -99,22 +104,45 @@ DATASETS = [
     ("visa",  Visa,    VISA_CATEGORIES,  "./datasets/VisA"),
 ]
 
+total_categories = sum(len(c) for _, _, c, _ in DATASETS)
+
 os.makedirs("results", exist_ok=True)
 PROGRESS_FILE = "results/patchcore_progress.json"
+
+# ── Startup banner ────────────────────────────────────────────
+print("=" * 60)
+print("  PatchCore-25%  |  WideResNet-50  |  Layers 2+3  |  Coreset 25%")
+print(f"  Runs per category : {N_RUNS}")
+print(f"  Categories total  : {total_categories}  ({len(MVTEC_CATEGORIES)} MVTec + {len(VISA_CATEGORIES)} VisA)")
+print(f"  Max VRAM limit    : {MAX_VRAM_GB:.1f} GB  ({'disabled' if MAX_VRAM_GB <= 0 else 'active'})")
+print(f"  FLOPs (thop)      : {'available' if HAS_THOP else 'not installed — skipped'}")
+print(f"  CPU mem (psutil)  : {'available' if HAS_PSUTIL else 'not installed — skipped'}")
+print(f"  F1Max metric      : {'available' if HAS_F1MAX else 'not in this anomalib version — skipped'}")
+gpu_info = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU only"
+print(f"  Device            : {gpu_info}")
+print("=" * 60)
 
 if os.path.exists(PROGRESS_FILE):
     with open(PROGRESS_FILE) as f:
         results = json.load(f)
-    print(f"Resuming from {PROGRESS_FILE}")
+    print(f"\n[resume] Found checkpoint — resuming from {PROGRESS_FILE}")
 else:
     results = {ds: {} for ds, *_ in DATASETS}
+    print("\n[start] No checkpoint found — starting fresh.")
+
+# ── OOM skip tracking ─────────────────────────────────────────
+oom_skips: list[dict] = []   # {"ds": ..., "category": ..., "run": ...}
 
 # ── Experiment loop ───────────────────────────────────────────
-for ds_name, DataModule, categories, root in DATASETS:
-    for category in categories:
+for ds_idx, (ds_name, DataModule, categories, root) in enumerate(DATASETS, 1):
+    print(f"\n{'─'*60}")
+    print(f"  Dataset {ds_idx}/{len(DATASETS)}: {ds_name.upper()}  ({len(categories)} categories)")
+    print(f"{'─'*60}")
+
+    for cat_idx, category in enumerate(categories, 1):
         runs_done = len(results.get(ds_name, {}).get(category, []))
         if runs_done >= N_RUNS:
-            print(f"[skip] {ds_name}/{category} — {runs_done}/{N_RUNS} runs done")
+            print(f"  [skip] {category} ({cat_idx}/{len(categories)}) — {runs_done}/{N_RUNS} runs already done")
             continue
 
         if ds_name not in results:
@@ -122,22 +150,26 @@ for ds_name, DataModule, categories, root in DATASETS:
         if category not in results[ds_name]:
             results[ds_name][category] = []
 
+        print(f"\n  [{cat_idx}/{len(categories)}] {category}  — {N_RUNS - runs_done} run(s) remaining")
+
         for run in range(runs_done, N_RUNS):
-            print(f"\n{'='*50}")
+            print(f"\n  {'='*48}")
             print(f"  {ds_name.upper()}  |  {category}  |  Run {run+1}/{N_RUNS}")
-            print(f"{'='*50}")
+            print(f"  {'='*48}")
 
             if not vram_ok():
-                print(f"[WARN] VRAM > {MAX_VRAM_GB:.1f} GB — freeing before run.")
+                vram_used = torch.cuda.memory_reserved() / 1e9 if torch.cuda.is_available() else 0
+                print(f"  [WARN] VRAM {vram_used:.2f} GB > limit {MAX_VRAM_GB:.1f} GB — freeing...")
                 free_gpu()
                 if not vram_ok():
-                    print("[SKIP] VRAM still over threshold. Skipping run.")
+                    print(f"  [SKIP] VRAM still over threshold after free. Skipping run {run+1}.")
                     continue
 
             model = engine = datamodule = evaluator = None
             image_auroc = pixel_auroc = pixel_pro = None
             image_f1max = pixel_f1max = test_results = metrics = None
             try:
+                print(f"  → Loading datamodule...")
                 # (§4.1): "No data augmentation is applied"
                 datamodule = DataModule(
                     root=root,
@@ -158,6 +190,7 @@ for ds_name, DataModule, categories, root in DATASETS:
                     test_metrics += [image_f1max, pixel_f1max]
                 evaluator = Evaluator(test_metrics=test_metrics)
 
+                print(f"  → Building model (WRN50 backbone)...")
                 # (§3.1, §3.2, §4.4.1)
                 model = Patchcore(
                     # (§3.1): "WideResnet-50" — ImageNet-pretrained backbone
@@ -180,9 +213,12 @@ for ds_name, DataModule, categories, root in DATASETS:
 
                 # Parameter count (backbone only; coreset is a buffer, not params)
                 n_params = sum(p.numel() for p in model.parameters())
+                print(f"  → Parameters: {n_params:,}")
 
+                print(f"  → Training (building coreset)...")
                 engine = Engine(max_epochs=1, logger=False, callbacks=[CompactBar()])
                 engine.fit(model=model, datamodule=datamodule)
+                print(f"  → Coreset built.")
 
                 # ── FLOPs: backbone forward pass on one image ─────────
                 flops_M = None
@@ -196,6 +232,7 @@ for ds_name, DataModule, categories, root in DATASETS:
                                 model.model.feature_extractor, inputs=(_dummy,), verbose=False
                             )
                         flops_M = round(_flops / 1e6, 1)
+                        print(f"  → Backbone FLOPs: {flops_M:.1f} M")
                         del _dummy
                     except Exception:
                         pass
@@ -204,6 +241,7 @@ for ds_name, DataModule, categories, root in DATASETS:
                 inference_cpu_s = None
                 peak_cpu_mb = None
                 try:
+                    print(f"  → Timing CPU inference (backbone, 1 image)...")
                     _feat = model.model.feature_extractor.cpu().eval()
                     _dummy_cpu = torch.randn(1, 3, 224, 224)
                     with torch.no_grad():
@@ -217,6 +255,8 @@ for ds_name, DataModule, categories, root in DATASETS:
                     inference_cpu_s = round(time.perf_counter() - _t, 4)
                     if HAS_PSUTIL:
                         peak_cpu_mb = round(max(0.0, _proc.memory_info().rss / 1e6 - _mem0), 1)
+                    print(f"  → CPU inference: {inference_cpu_s:.4f}s"
+                          + (f"  |  peak CPU RAM delta: {peak_cpu_mb:.1f} MB" if peak_cpu_mb is not None else ""))
                     del _dummy_cpu
                     # restore backbone to GPU if available
                     if torch.cuda.is_available():
@@ -225,6 +265,7 @@ for ds_name, DataModule, categories, root in DATASETS:
                     pass
 
                 # ── GPU inference with peak VRAM tracking ────────────
+                print(f"  → Running inference on test set (GPU)...")
                 if torch.cuda.is_available():
                     torch.cuda.reset_peak_memory_stats()
 
@@ -237,13 +278,24 @@ for ds_name, DataModule, categories, root in DATASETS:
                     peak_gpu_mb = round(torch.cuda.max_memory_allocated() / 1e6, 1)
 
                 metrics = test_results[0]
+                img_auc  = metrics.get("image_AUROC", 0) * 100
+                pxl_auc  = metrics.get("pixel_AUROC", 0) * 100
+                pxl_pro  = metrics.get("pixel_AUPRO", 0) * 100
+                img_f1   = (metrics["image_F1Max"] * 100) if metrics.get("image_F1Max") is not None else None
+                pxl_f1   = (metrics["pixel_F1Max"] * 100) if metrics.get("pixel_F1Max") is not None else None
+
+                print(f"  → Results: Img AUROC {img_auc:.1f}% | Pxl AUROC {pxl_auc:.1f}%"
+                      f" | AUPRO {pxl_pro:.1f}%"
+                      + (f" | Img F1Max {img_f1:.1f}%" if img_f1 is not None else ""))
+                print(f"  → GPU inf: {elapsed_gpu:.3f}s  |  Peak GPU: {peak_gpu_mb:.1f} MB")
+
                 results[ds_name][category].append({
                     # ── Accuracy ──────────────────────────────────────
-                    "image_AUROC":     metrics.get("image_AUROC", 0) * 100,
-                    "pixel_AUROC":     metrics.get("pixel_AUROC", 0) * 100,
-                    "pixel_AUPRO":     metrics.get("pixel_AUPRO", 0) * 100,
-                    "image_F1Max":     metrics.get("image_F1Max", None) and metrics["image_F1Max"] * 100,
-                    "pixel_F1Max":     metrics.get("pixel_F1Max", None) and metrics["pixel_F1Max"] * 100,
+                    "image_AUROC":     img_auc,
+                    "pixel_AUROC":     pxl_auc,
+                    "pixel_AUPRO":     pxl_pro,
+                    "image_F1Max":     img_f1,
+                    "pixel_F1Max":     pxl_f1,
                     # ── Efficiency ────────────────────────────────────
                     "n_params":        n_params,
                     "flops_M":         flops_M,
@@ -255,10 +307,13 @@ for ds_name, DataModule, categories, root in DATASETS:
 
                 with open(PROGRESS_FILE, "w") as f:
                     json.dump(results, f, indent=2)
+                print(f"  → Checkpoint saved.")
 
             except Exception as e:
                 if "out of memory" in str(e).lower():
-                    print(f"[OOM] CUDA out of memory — {ds_name}/{category} run {run+1}. Skipping.")
+                    oom_skips.append({"ds": ds_name, "category": category, "run": run + 1})
+                    print(f"\n  [OOM] CUDA out of memory — {ds_name}/{category} run {run+1}. "
+                          f"Skipping. (total OOM skips so far: {len(oom_skips)})")
                     with open(PROGRESS_FILE, "w") as f:
                         json.dump(results, f, indent=2)
                 else:
@@ -268,6 +323,24 @@ for ds_name, DataModule, categories, root in DATASETS:
                 del image_auroc, pixel_auroc, pixel_pro, image_f1max, pixel_f1max
                 del test_results, metrics
                 free_gpu()
+
+# ── Post-loop: clean up checkpoint + OOM summary ─────────────
+print(f"\n{'='*60}")
+print("  All runs complete.")
+
+if oom_skips:
+    print(f"\n  [OOM summary] {len(oom_skips)} run(s) skipped due to CUDA out of memory:")
+    for s in oom_skips:
+        print(f"    • {s['ds']}/{s['category']}  run {s['run']}")
+else:
+    print("  No OOM skips.")
+
+if os.path.exists(PROGRESS_FILE):
+    os.remove(PROGRESS_FILE)
+    print(f"\n  Checkpoint deleted ({PROGRESS_FILE}).")
+    print("  Next invocation will start fresh.")
+
+print(f"{'='*60}\n")
 
 # ── Result helpers ────────────────────────────────────────────
 def _mean(runs: list[dict], key: str) -> float:
@@ -372,7 +445,6 @@ for ds_name, _, categories, _ in DATASETS:
 
     if cat_eff:
         lines.append("-" * len(HDR_E))
-        # params and FLOPs are constant across categories — take from first
         _first = next(iter(cat_eff.values()))
         def _avg_eff(key):
             vals = [v[key] for v in cat_eff.values() if v[key] == v[key]]
@@ -397,8 +469,9 @@ all_cats = [
 n_all = len(all_cats)
 if n_all:
     def _omean(key):
-        return statistics.mean(_mean(results[ds][c], key) for ds, c in all_cats
-                               if _mean(results[ds][c], key) == _mean(results[ds][c], key))
+        vals = [_mean(results[ds][c], key) for ds, c in all_cats]
+        vals = [v for v in vals if v == v]
+        return statistics.mean(vals) if vals else float("nan")
     oi   = _omean("image_AUROC")
     op   = _omean("pixel_AUROC")
     opr  = _omean("pixel_AUPRO")
@@ -411,10 +484,21 @@ if n_all:
     lines.append(f"  Img AUROC : {oi:.2f}%   Pxl AUROC : {op:.2f}%   AUPRO : {opr:.2f}%")
     lines.append(f"  Img F1Max : {of1i:.2f}%   Pxl F1Max : {of1p:.2f}%")
     lines.append(f"  GPU inf   : {ogi:.3f}s")
-    lines.append("=" * 80)
+
+# ── OOM section in results file ───────────────────────────────
+if oom_skips:
+    lines.append(f"\n{'='*80}")
+    lines.append(f"  OOM Skips ({len(oom_skips)} total)")
+    lines.append(f"{'='*80}")
+    for s in oom_skips:
+        lines.append(f"  • {s['ds']}/{s['category']}  run {s['run']}")
+else:
+    lines.append("\n  No OOM skips recorded.")
+
+lines.append("=" * 80)
 
 output = "\n".join(lines)
-print("\n" + output)
+print(output)
 with open(out_path, "w") as f:
     f.write(output + "\n")
 print(f"\nResults saved to {out_path}")
