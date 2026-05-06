@@ -237,32 +237,43 @@ for ds_idx, (ds_name, DataModule, categories, root) in enumerate(DATASETS, 1):
                     except Exception:
                         pass
 
-                # ── CPU inference: backbone on 1 image (warmup + timed) ──
+                # ── CPU inference: backbone on 1 image (warmup + avg of 5) ──
+                # Uses tracemalloc for peak memory (RSS delta is unreliable).
                 inference_cpu_s = None
                 peak_cpu_mb = None
                 try:
-                    print(f"  → Timing CPU inference (backbone, 1 image)...")
+                    import tracemalloc
+                    print(f"  → Timing CPU inference (backbone, 1 image × 5 runs)...")
                     _feat = model.model.feature_extractor.cpu().eval()
-                    _dummy_cpu = torch.randn(1, 3, 224, 224)
-                    with torch.no_grad():
-                        _feat(_dummy_cpu)                          # warmup
-                    if HAS_PSUTIL:
-                        _proc = _psutil.Process(os.getpid())
-                        _mem0 = _proc.memory_info().rss / 1e6
-                    _t = time.perf_counter()
-                    with torch.no_grad():
-                        _feat(_dummy_cpu)
-                    inference_cpu_s = round(time.perf_counter() - _t, 4)
-                    if HAS_PSUTIL:
-                        peak_cpu_mb = round(max(0.0, _proc.memory_info().rss / 1e6 - _mem0), 1)
-                    print(f"  → CPU inference: {inference_cpu_s:.4f}s"
-                          + (f"  |  peak CPU RAM delta: {peak_cpu_mb:.1f} MB" if peak_cpu_mb is not None else ""))
+                    # verify weights actually moved to CPU
+                    _dev = next(_feat.parameters()).device
+                    if str(_dev) != "cpu":
+                        raise RuntimeError(f"Backbone still on {_dev} after .cpu()")
+                    _dummy_cpu = torch.randn(1, 3, 224, 224)  # already on CPU
+                    # warmup — 3 passes to stabilise branch prediction / caches
+                    for _ in range(3):
+                        with torch.no_grad():
+                            _feat(_dummy_cpu)
+                    # timed — average of 5 passes; tracemalloc tracks peak alloc
+                    tracemalloc.start()
+                    _times = []
+                    for _ in range(5):
+                        _t = time.perf_counter()
+                        with torch.no_grad():
+                            _feat(_dummy_cpu)
+                        _times.append(time.perf_counter() - _t)
+                    _, _peak_bytes = tracemalloc.get_traced_memory()
+                    tracemalloc.stop()
+                    inference_cpu_s = round(statistics.mean(_times), 4)
+                    peak_cpu_mb     = round(_peak_bytes / 1e6, 1)
+                    print(f"  → CPU inference: {inference_cpu_s:.4f}s (avg 5 runs)"
+                          f"  |  peak CPU alloc: {peak_cpu_mb:.1f} MB")
                     del _dummy_cpu
-                    # restore backbone to GPU if available
+                    # restore backbone to GPU for the upcoming engine.test()
                     if torch.cuda.is_available():
                         model.model.feature_extractor.cuda()
-                except Exception:
-                    pass
+                except Exception as _cpu_err:
+                    print(f"  [WARN] CPU timing failed: {_cpu_err}")
 
                 # ── GPU inference with peak VRAM tracking ────────────
                 print(f"  → Running inference on test set (GPU)...")
