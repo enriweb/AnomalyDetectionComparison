@@ -2,26 +2,61 @@
 PatchCore-25%
 
 Usage:
-    python patchcode.py          # 1 run (default)
-    python patchcode.py 3        # 3 runs, results averaged
+    python patchcore.py          # 1 run (default)
+    python patchcore.py 3        # 3 runs, results averaged
 """
 
 import gc
 import json
+import logging
 import os
 import statistics
 import sys
 import time
+import warnings
+
+# ── Silence warnings and noisy loggers ───────────────────────
+warnings.filterwarnings("ignore")
+os.environ["PYTHONWARNINGS"] = "ignore"
+for _log in ("lightning", "lightning.pytorch", "anomalib", "torchvision", "torch"):
+    logging.getLogger(_log).setLevel(logging.ERROR)
 
 import torch
 from anomalib.data import MVTecAD, Visa
 from anomalib.engine import Engine
 from anomalib.metrics import AUPRO, AUROC, Evaluator
 from anomalib.models import Patchcore
+from lightning.pytorch.callbacks import TQDMProgressBar
 
-# ── How many runs to average ──────────────────────────────────
-N_RUNS: int = int(sys.argv[1]) if len(sys.argv) > 1 else 1
+# ── Config ────────────────────────────────────────────────────
+N_RUNS: int        = int(sys.argv[1]) if len(sys.argv) > 1 else 1
+MAX_VRAM_GB: float = 8.0   # reserved VRAM limit before each run; 0 = disabled
 
+# ── GPU helpers ───────────────────────────────────────────────
+def free_gpu() -> None:
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+def vram_ok() -> bool:
+    if not torch.cuda.is_available() or MAX_VRAM_GB <= 0:
+        return True
+    return torch.cuda.memory_reserved() / 1e9 < MAX_VRAM_GB
+
+# ── Single-line progress bar ──────────────────────────────────
+class CompactBar(TQDMProgressBar):
+    """TQDMProgressBar with leave=False so each bar stays on one line."""
+    def init_train_tqdm(self):
+        bar = super().init_train_tqdm(); bar.leave = False; return bar
+    def init_test_tqdm(self):
+        bar = super().init_test_tqdm(); bar.leave = False; return bar
+    def init_validation_tqdm(self):
+        bar = super().init_validation_tqdm(); bar.leave = False; return bar
+    def init_predict_tqdm(self):
+        bar = super().init_predict_tqdm(); bar.leave = False; return bar
+
+# ── Dataset config ────────────────────────────────────────────
 MVTEC_CATEGORIES = [
     "bottle", "cable", "capsule", "carpet", "grid",
     "hazelnut", "leather", "metal_nut", "pill", "screw",
@@ -40,7 +75,6 @@ DATASETS = [
 os.makedirs("results", exist_ok=True)
 PROGRESS_FILE = "results/patchcore_progress.json"
 
-# results[ds_name][category] = list of per-run dicts
 if os.path.exists(PROGRESS_FILE):
     with open(PROGRESS_FILE) as f:
         results = json.load(f)
@@ -63,71 +97,83 @@ for ds_name, DataModule, categories, root in DATASETS:
 
         for run in range(runs_done, N_RUNS):
             print(f"\n{'='*50}")
-            print(f"  Dataset: {ds_name.upper()}  |  Category: {category}  |  Run {run+1}/{N_RUNS}")
+            print(f"  {ds_name.upper()}  |  {category}  |  Run {run+1}/{N_RUNS}")
             print(f"{'='*50}")
 
-            # (§4.1): "images are resized and center cropped to 256x256 and 224x224"
-            # (§4.1): "No data augmentation is applied"
-            datamodule = DataModule(
-                root=root,
-                category=category,
-                train_batch_size=32,
-                eval_batch_size=32,
-            )
+            if not vram_ok():
+                print(f"[WARN] VRAM > {MAX_VRAM_GB:.1f} GB — freeing before run.")
+                free_gpu()
+                if not vram_ok():
+                    print("[SKIP] VRAM still over threshold. Skipping run.")
+                    continue
 
-            image_auroc = AUROC(fields=["pred_score", "gt_label"], prefix="image_")
-            pixel_auroc = AUROC(fields=["anomaly_map", "gt_mask"], prefix="pixel_")
-            # fpr_limit=0.3 matches paper Table 3
-            pixel_pro = AUPRO(fields=["anomaly_map", "gt_mask"], prefix="pixel_")
-            evaluator = Evaluator(test_metrics=[image_auroc, pixel_auroc, pixel_pro])
+            model = engine = datamodule = evaluator = None
+            image_auroc = pixel_auroc = pixel_pro = test_results = metrics = None
+            try:
+                # (§4.1): "No data augmentation is applied"
+                datamodule = DataModule(
+                    root=root,
+                    category=category,
+                    train_batch_size=32,
+                    eval_batch_size=32,
+                )
 
-            # (§3.1, §3.2, §4.4.1)
-            model = Patchcore(
-                # (§3.1): "WideResnet-50" — ImageNet-pretrained backbone
-                backbone="wide_resnet50_2",
-                # (§4.4.1, Fig.4 bottom): "2+3, which is chosen as the default setting"
-                layers=["layer2", "layer3"],
-                pre_trained=True,
-                # (§3.2, Table 1): PatchCore-25% = 25% coreset subsampling
-                coreset_sampling_ratio=0.25,
-                # (Eq.7): num_neighbors b for re-weighting (anomalib default=9)
-                num_neighbors=9,
-                # (§4.1): resize 256×256 then center crop 224×224
-                pre_processor=Patchcore.configure_pre_processor(
-                    image_size=(256, 256),
-                    center_crop_size=(224, 224),
-                ),
-                evaluator=evaluator,
-                visualizer=False,
-            )
+                image_auroc = AUROC(fields=["pred_score", "gt_label"], prefix="image_")
+                pixel_auroc = AUROC(fields=["anomaly_map", "gt_mask"], prefix="pixel_")
+                pixel_pro   = AUPRO(fields=["anomaly_map", "gt_mask"], prefix="pixel_")
+                evaluator   = Evaluator(test_metrics=[image_auroc, pixel_auroc, pixel_pro])
 
-            engine = Engine(max_epochs=1, logger=False)
-            engine.fit(model=model, datamodule=datamodule)
+                # (§3.1, §3.2, §4.4.1)
+                model = Patchcore(
+                    # (§3.1): "WideResnet-50" — ImageNet-pretrained backbone
+                    backbone="wide_resnet50_2",
+                    # (§4.4.1, Fig.4 bottom): "2+3, which is chosen as the default setting"
+                    layers=["layer2", "layer3"],
+                    pre_trained=True,
+                    # (§3.2, Table 1): PatchCore-25% = 25% coreset subsampling
+                    coreset_sampling_ratio=0.25,
+                    # (Eq.7): num_neighbors b for re-weighting (anomalib default=9)
+                    num_neighbors=9,
+                    # (§4.1): "images are resized and center cropped to 256×256 and 224×224"
+                    pre_processor=Patchcore.configure_pre_processor(
+                        image_size=(256, 256),
+                        center_crop_size=(224, 224),
+                    ),
+                    evaluator=evaluator,
+                    visualizer=False,
+                )
 
-            t0 = time.time()
-            test_results = engine.test(model=model, datamodule=datamodule)
-            elapsed = time.time() - t0
+                engine = Engine(max_epochs=1, logger=False, callbacks=[CompactBar()])
+                engine.fit(model=model, datamodule=datamodule)
 
-            metrics = test_results[0]
-            results[ds_name][category].append({
-                "image_AUROC": metrics.get("image_AUROC", 0) * 100,
-                "pixel_AUROC": metrics.get("pixel_AUROC", 0) * 100,
-                "pixel_AUPRO": metrics.get("pixel_AUPRO", 0) * 100,
-                "inference_s": elapsed,
-            })
+                t0 = time.time()
+                test_results = engine.test(model=model, datamodule=datamodule)
+                elapsed = time.time() - t0
 
-            # Persist after each run — survive crashes
-            with open(PROGRESS_FILE, "w") as f:
-                json.dump(results, f, indent=2)
+                metrics = test_results[0]
+                results[ds_name][category].append({
+                    "image_AUROC": metrics.get("image_AUROC", 0) * 100,
+                    "pixel_AUROC": metrics.get("pixel_AUROC", 0) * 100,
+                    "pixel_AUPRO": metrics.get("pixel_AUPRO", 0) * 100,
+                    "inference_s": elapsed,
+                })
 
-            # Free memory bank, backbone weights, dataset tensors
-            del model, engine, datamodule, evaluator
-            del image_auroc, pixel_auroc, pixel_pro, test_results, metrics
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+                with open(PROGRESS_FILE, "w") as f:
+                    json.dump(results, f, indent=2)
 
-# ── Helpers ───────────────────────────────────────────────────
+            except Exception as e:
+                if "out of memory" in str(e).lower():
+                    print(f"[OOM] CUDA out of memory — {ds_name}/{category} run {run+1}. Skipping.")
+                    with open(PROGRESS_FILE, "w") as f:
+                        json.dump(results, f, indent=2)
+                else:
+                    raise
+            finally:
+                del model, engine, datamodule, evaluator
+                del image_auroc, pixel_auroc, pixel_pro, test_results, metrics
+                free_gpu()
+
+# ── Result helpers ────────────────────────────────────────────
 def _mean(runs: list[dict], key: str) -> float:
     return statistics.mean(r[key] for r in runs)
 
@@ -135,15 +181,12 @@ def _std(runs: list[dict], key: str) -> float:
     return statistics.stdev(r[key] for r in runs) if len(runs) > 1 else 0.0
 
 def _fmt(mean: float, std: float) -> str:
-    if N_RUNS > 1:
-        return f"{mean:5.1f}±{std:4.1f}"
-    return f"{mean:10.1f}"
+    return f"{mean:5.1f}±{std:4.1f}" if N_RUNS > 1 else f"{mean:10.1f}"
 
 # ── Final results table ───────────────────────────────────────
 out_path = "results/patchcore_combined.txt"
-
 COL = 12 if N_RUNS > 1 else 10
-W = 15 + COL * 4 + 3
+W   = 15 + COL * 4 + 3
 HDR = f"{'Category':<15} {'Img AUROC':>{COL}} {'Pxl AUROC':>{COL}} {'PRO':>{COL}} {'Infer(s)':>{COL}}"
 
 lines = []
@@ -177,7 +220,6 @@ for ds_name, _, categories, _ in DATASETS:
         )
 
     if cat_means:
-        n = len(cat_means)
         avg = {k: statistics.mean(v[k] for v in cat_means.values()) for k in ("img", "pxl", "pro", "t")}
         lines.append("-" * W)
         lines.append(
