@@ -10,7 +10,7 @@ Metrics recorded per run:
                 image F1Max (optimal threshold), pixel F1Max
     Efficiency — n_params, FLOPs (backbone, thop optional),
                  inference time GPU + CPU (WRN50 backbone),
-                 peak + mean GPU MB, peak + mean CPU MB
+                 peak + mean GPU MB
 
 Progress is checkpointed to results/cfa_progress.json after every completed
 run. On normal exit the checkpoint is deleted. On crash / OOM the checkpoint
@@ -36,7 +36,7 @@ print("Importing torch-related libraries...")
 import torch
 from anomalib.data import MVTecAD, Visa
 from anomalib.engine import Engine
-from anomalib.metrics import AUPRO, AUROC, AnomalibMetric, Evaluator
+from anomalib.metrics import AUPRO, AUROC, Evaluator
 from anomalib.models import Cfa
 from lightning.pytorch.callbacks import TQDMProgressBar
 
@@ -49,61 +49,12 @@ try:
 except ImportError:
     HAS_F1MAX = False
 
-# FNR = FN/(FN+TP) at the F1-optimal threshold (lower is better)
-try:
-    from torchmetrics import Metric as _TMMetric
-
-    class _FNRBase(_TMMetric):
-        """False Negative Rate at the threshold that maximises F1."""
-        higher_is_better: bool = False
-        full_state_update: bool = False
-
-        def __init__(self, num_thresh: int = 200, **kwargs):
-            super().__init__(**kwargs)
-            self._num_thresh = num_thresh
-            self.add_state("preds",  default=[], dist_reduce_fx="cat")
-            self.add_state("labels", default=[], dist_reduce_fx="cat")
-
-        def update(self, preds, target) -> None:
-            self.preds.append(preds.float().detach().flatten())
-            self.labels.append(target.float().detach().flatten())
-
-        def compute(self) -> torch.Tensor:
-            p  = torch.cat(self.preds)
-            lb = torch.cat(self.labels).long()
-            ts = torch.linspace(p.min(), p.max(), self._num_thresh, device=p.device)
-            best_fnr, best_f1 = torch.tensor(1.0, device=p.device), -1.0
-            for t in ts:
-                pb = (p >= t).long()
-                tp = ((pb == 1) & (lb == 1)).sum().float()
-                fp = ((pb == 1) & (lb == 0)).sum().float()
-                fn = ((pb == 0) & (lb == 1)).sum().float()
-                f1 = 2 * tp / (2 * tp + fp + fn + 1e-8)
-                if f1.item() > best_f1:
-                    best_f1 = f1.item()
-                    best_fnr = fn / (fn + tp + 1e-8)
-            return best_fnr
-
-    class FNR(AnomalibMetric, _FNRBase):
-        pass
-
-    HAS_FNR = True
-except Exception:
-    HAS_FNR = False
-
 # FLOPs counting (pip install thop)
 try:
     from thop import profile as _thop_profile
     HAS_THOP = True
 except ImportError:
     HAS_THOP = False
-
-# CPU memory tracking (pip install psutil)
-try:
-    import psutil as _psutil
-    HAS_PSUTIL = True
-except ImportError:
-    HAS_PSUTIL = False
 
 # ── Config ────────────────────────────────────────────────────
 N_RUNS: int        = int(sys.argv[1]) if len(sys.argv) > 1 else 1
@@ -116,16 +67,13 @@ def free_gpu() -> None:
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
-def _start_mem_sampler(samples: list, use_gpu: bool, interval: float = 0.05) -> threading.Event:
-    """Spawn a daemon thread that appends GPU or RSS memory samples every `interval` s."""
+def _start_mem_sampler(samples: list, interval: float = 0.05) -> threading.Event:
+    """Spawn a daemon thread that appends GPU memory samples every `interval` s."""
     stop = threading.Event()
     def _run():
-        proc = _psutil.Process(os.getpid()) if (not use_gpu and HAS_PSUTIL) else None
         while not stop.is_set():
-            if use_gpu and torch.cuda.is_available():
+            if torch.cuda.is_available():
                 samples.append(torch.cuda.memory_allocated() / 1e6)
-            elif proc is not None:
-                samples.append(proc.memory_info().rss / 1e6)
             stop.wait(interval)
     threading.Thread(target=_run, daemon=True).start()
     return stop
@@ -174,9 +122,7 @@ print(f"  Runs per category : {N_RUNS}")
 print(f"  Categories total  : {total_categories}  ({len(MVTEC_CATEGORIES)} MVTec + {len(VISA_CATEGORIES)} VisA)")
 print(f"  Max VRAM limit    : {MAX_VRAM_GB:.1f} GB  ({'disabled' if MAX_VRAM_GB <= 0 else 'active'})")
 print(f"  FLOPs (thop)      : {'available' if HAS_THOP else 'not installed — skipped'}")
-print(f"  CPU mem (psutil)  : {'available' if HAS_PSUTIL else 'not installed — skipped'}")
 print(f"  F1Max metric      : {'available' if HAS_F1MAX else 'not in this anomalib version — skipped'}")
-print(f"  FNR metric        : {'available' if HAS_FNR else 'torchmetrics missing — skipped'}")
 gpu_info = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU only"
 print(f"  Device            : {gpu_info}")
 print("=" * 60)
@@ -226,7 +172,7 @@ for ds_idx, (ds_name, DataModule, categories, root) in enumerate(DATASETS, 1):
 
             model = engine = datamodule = evaluator = None
             image_auroc = pixel_auroc = pixel_pro = None
-            image_f1max = pixel_f1max = image_fnr = pixel_fnr = test_results = metrics = None
+            image_f1max = pixel_f1max = test_results = metrics = None
             try:
                 print(f"  → Loading datamodule...")
                 # (§4.1): "each sample is resized into 256×256, center-cropped into 224×224"
@@ -246,10 +192,6 @@ for ds_idx, (ds_name, DataModule, categories, root) in enumerate(DATASETS, 1):
                     image_f1max = F1Max(fields=["pred_score", "gt_label"], prefix="image_")
                     pixel_f1max = F1Max(fields=["anomaly_map", "gt_mask"],  prefix="pixel_")
                     test_metrics += [image_f1max, pixel_f1max]
-                if HAS_FNR:
-                    image_fnr = FNR(fields=["pred_score", "gt_label"], prefix="image_")
-                    pixel_fnr = FNR(fields=["anomaly_map", "gt_mask"],  prefix="pixel_")
-                    test_metrics += [image_fnr, pixel_fnr]
                 evaluator = Evaluator(test_metrics=test_metrics)
 
                 print(f"  → Building model (WRN50 backbone)...")
@@ -301,12 +243,9 @@ for ds_idx, (ds_name, DataModule, categories, root) in enumerate(DATASETS, 1):
                     except Exception:
                         pass
 
-                # ── CPU inference: backbone on 1 image ────────────────
+                # ── CPU inference: backbone on 1 image (warmup + avg of 5) ──
                 inference_cpu_s = None
-                peak_cpu_mb = None
-                mean_cpu_mb = None
                 try:
-                    import tracemalloc
                     print(f"  → Timing CPU inference (backbone, 1 image × 5 runs)...")
                     _feat = model.model.feature_extractor.cpu().eval()
                     _dev = next(_feat.parameters()).device
@@ -316,29 +255,14 @@ for ds_idx, (ds_name, DataModule, categories, root) in enumerate(DATASETS, 1):
                     for _ in range(3):
                         with torch.no_grad():
                             _feat(_dummy_cpu)
-                    _cpu_rss_samples: list = []
-                    _cpu_stop = _start_mem_sampler(_cpu_rss_samples, use_gpu=False)
-                    _baseline_rss = (_psutil.Process(os.getpid()).memory_info().rss / 1e6
-                                     if HAS_PSUTIL else 0.0)
-                    tracemalloc.start()
                     _times = []
                     for _ in range(5):
                         _t = time.perf_counter()
                         with torch.no_grad():
                             _feat(_dummy_cpu)
                         _times.append(time.perf_counter() - _t)
-                    _, _peak_bytes = tracemalloc.get_traced_memory()
-                    tracemalloc.stop()
-                    _cpu_stop.set()
                     inference_cpu_s = round(statistics.mean(_times), 4)
-                    peak_cpu_mb     = round(_peak_bytes / 1e6, 1)
-                    if _cpu_rss_samples:
-                        mean_cpu_mb = round(
-                            max(0.0, statistics.mean(_cpu_rss_samples) - _baseline_rss), 1
-                        )
-                    print(f"  → CPU inference: {inference_cpu_s:.4f}s (avg 5 runs)"
-                          f"  |  peak: {peak_cpu_mb:.1f} MB"
-                          + (f"  |  mean: {mean_cpu_mb:.1f} MB" if mean_cpu_mb is not None else ""))
+                    print(f"  → CPU inference: {inference_cpu_s:.4f}s (avg 5 runs)")
                     del _dummy_cpu
                     if torch.cuda.is_available():
                         model.model.feature_extractor.cuda()
@@ -348,7 +272,7 @@ for ds_idx, (ds_name, DataModule, categories, root) in enumerate(DATASETS, 1):
                 # ── GPU inference with peak + mean VRAM tracking ─────
                 print(f"  → Running inference on test set (GPU)...")
                 _gpu_samples: list = []
-                _gpu_stop = _start_mem_sampler(_gpu_samples, use_gpu=True)
+                _gpu_stop = _start_mem_sampler(_gpu_samples)
                 if torch.cuda.is_available():
                     torch.cuda.reset_peak_memory_stats()
 
@@ -370,13 +294,10 @@ for ds_idx, (ds_name, DataModule, categories, root) in enumerate(DATASETS, 1):
                 pxl_pro  = metrics.get("pixel_AUPRO", 0) * 100
                 img_f1   = (metrics["image_F1Max"] * 100) if metrics.get("image_F1Max") is not None else None
                 pxl_f1   = (metrics["pixel_F1Max"] * 100) if metrics.get("pixel_F1Max") is not None else None
-                img_fnr  = (metrics["image_FNR"] * 100) if metrics.get("image_FNR") is not None else None
-                pxl_fnr  = (metrics["pixel_FNR"] * 100) if metrics.get("pixel_FNR") is not None else None
 
                 print(f"  → Results: Img AUROC {img_auc:.1f}% | Pxl AUROC {pxl_auc:.1f}%"
                       f" | AUPRO {pxl_pro:.1f}%"
-                      + (f" | F1Max {img_f1:.1f}%" if img_f1 is not None else "")
-                      + (f" | ImgFNR {img_fnr:.1f}%" if img_fnr is not None else ""))
+                      + (f" | F1Max {img_f1:.1f}%" if img_f1 is not None else ""))
                 print(f"  → GPU inf: {elapsed_gpu:.3f}s  |  Peak GPU: {peak_gpu_mb:.1f} MB"
                       f"  |  Mean GPU: {mean_gpu_mb:.1f} MB")
 
@@ -387,8 +308,6 @@ for ds_idx, (ds_name, DataModule, categories, root) in enumerate(DATASETS, 1):
                     "pixel_AUPRO":     pxl_pro,
                     "image_F1Max":     img_f1,
                     "pixel_F1Max":     pxl_f1,
-                    "image_FNR":       img_fnr,
-                    "pixel_FNR":       pxl_fnr,
                     # ── Efficiency ────────────────────────────────────
                     "n_params":        n_params,
                     "flops_M":         flops_M,
@@ -396,8 +315,6 @@ for ds_idx, (ds_name, DataModule, categories, root) in enumerate(DATASETS, 1):
                     "inference_cpu_s": inference_cpu_s,
                     "peak_gpu_mb":     peak_gpu_mb,
                     "mean_gpu_mb":     mean_gpu_mb,
-                    "peak_cpu_mb":     peak_cpu_mb,
-                    "mean_cpu_mb":     mean_cpu_mb,
                 })
 
                 with open(PROGRESS_FILE, "w") as f:
@@ -415,7 +332,7 @@ for ds_idx, (ds_name, DataModule, categories, root) in enumerate(DATASETS, 1):
                     raise
             finally:
                 del model, engine, datamodule, evaluator
-                del image_auroc, pixel_auroc, pixel_pro, image_f1max, pixel_f1max, image_fnr, pixel_fnr
+                del image_auroc, pixel_auroc, pixel_pro, image_f1max, pixel_f1max
                 del test_results, metrics
                 free_gpu()
 
@@ -471,8 +388,7 @@ for ds_name, _, categories, _ in DATASETS:
     # ── Accuracy table ────────────────────────────────────────
     lines.append(f"\n--- {label} — Accuracy ---")
     HDR_A = (f"{'Category':<15} {'Img AUROC':>{C}} {'Pxl AUROC':>{C}}"
-             f" {'AUPRO':>{C}} {'Img F1Max':>{C}} {'Pxl F1Max':>{C}}"
-             f" {'Img FNR':>{C}} {'Pxl FNR':>{C}}")
+             f" {'AUPRO':>{C}} {'Img F1Max':>{C}} {'Pxl F1Max':>{C}}")
     lines.append(HDR_A)
     lines.append("-" * len(HDR_A))
 
@@ -482,8 +398,7 @@ for ds_name, _, categories, _ in DATASETS:
         if not runs:
             continue
         r = {k: (_mean(runs, k), _std(runs, k)) for k in
-             ("image_AUROC", "pixel_AUROC", "pixel_AUPRO", "image_F1Max", "pixel_F1Max",
-              "image_FNR", "pixel_FNR")}
+             ("image_AUROC", "pixel_AUROC", "pixel_AUPRO", "image_F1Max", "pixel_F1Max")}
         cat_acc[cat] = {k: v[0] for k, v in r.items()}
         lines.append(
             f"{cat:<15}"
@@ -492,14 +407,11 @@ for ds_name, _, categories, _ in DATASETS:
             f" {_fmt(*r['pixel_AUPRO']):>{C}}"
             f" {_fmt(*r['image_F1Max']):>{C}}"
             f" {_fmt(*r['pixel_F1Max']):>{C}}"
-            f" {_fmt(*r['image_FNR']):>{C}}"
-            f" {_fmt(*r['pixel_FNR']):>{C}}"
         )
 
     if cat_acc:
         avg = {k: statistics.mean(v for v in (c[k] for c in cat_acc.values()) if v == v)
-               for k in ("image_AUROC", "pixel_AUROC", "pixel_AUPRO", "image_F1Max", "pixel_F1Max",
-                         "image_FNR", "pixel_FNR")}
+               for k in ("image_AUROC", "pixel_AUROC", "pixel_AUPRO", "image_F1Max", "pixel_F1Max")}
         lines.append("-" * len(HDR_A))
         lines.append(
             f"{'MEAN':<15}"
@@ -508,16 +420,13 @@ for ds_name, _, categories, _ in DATASETS:
             f" {avg['pixel_AUPRO']:>{C}.1f}"
             f" {avg.get('image_F1Max', float('nan')):>{C}.1f}"
             f" {avg.get('pixel_F1Max', float('nan')):>{C}.1f}"
-            f" {avg.get('image_FNR', float('nan')):>{C}.1f}"
-            f" {avg.get('pixel_FNR', float('nan')):>{C}.1f}"
         )
 
     # ── Efficiency table ──────────────────────────────────────
     lines.append(f"\n--- {label} — Efficiency ---")
     HDR_E = (f"{'Category':<15} {'Params':>{CE}} {'FLOPs(M)':>{CE}}"
              f" {'GPU inf(s)':>{CE}} {'CPU inf(s)':>{CE}}"
-             f" {'PkGPU(MB)':>{CE}} {'MnGPU(MB)':>{CE}}"
-             f" {'PkCPU(MB)':>{CE}} {'MnCPU(MB)':>{CE}}")
+             f" {'PkGPU(MB)':>{CE}} {'MnGPU(MB)':>{CE}}")
     lines.append(HDR_E)
     lines.append("-" * len(HDR_E))
 
@@ -535,10 +444,8 @@ for ds_name, _, categories, _ in DATASETS:
         ci_  = _mean(runs, "inference_cpu_s")
         pgm_ = _mean(runs, "peak_gpu_mb")
         mgm_ = _mean(runs, "mean_gpu_mb")
-        pcm_ = _mean(runs, "peak_cpu_mb")
-        mcm_ = _mean(runs, "mean_cpu_mb")
         cat_eff[cat] = {"np": np_, "fl": fl_, "gpu": gi_, "cpu": ci_,
-                        "pgm": pgm_, "mgm": mgm_, "pcm": pcm_, "mcm": mcm_}
+                        "pgm": pgm_, "mgm": mgm_}
         lines.append(
             f"{cat:<15}"
             f" {_fe(np_,  '{:,.0f}')}"
@@ -547,8 +454,6 @@ for ds_name, _, categories, _ in DATASETS:
             f" {_fe(ci_,  '{:.4f}')}"
             f" {_fe(pgm_, '{:.1f}')}"
             f" {_fe(mgm_, '{:.1f}')}"
-            f" {_fe(pcm_, '{:.1f}')}"
-            f" {_fe(mcm_, '{:.1f}')}"
         )
 
     if cat_eff:
@@ -565,8 +470,6 @@ for ds_name, _, categories, _ in DATASETS:
             f" {_fe(_avg_eff('cpu'), '{:.4f}')}"
             f" {_fe(_avg_eff('pgm'), '{:.1f}')}"
             f" {_fe(_avg_eff('mgm'), '{:.1f}')}"
-            f" {_fe(_avg_eff('pcm'), '{:.1f}')}"
-            f" {_fe(_avg_eff('mcm'), '{:.1f}')}"
         )
 
 # ── Overall summary ───────────────────────────────────────────
@@ -587,15 +490,12 @@ if n_all:
     opr  = _omean("pixel_AUPRO")
     of1i  = _omean("image_F1Max")
     of1p  = _omean("pixel_F1Max")
-    ofnri = _omean("image_FNR")
-    ofnrp = _omean("pixel_FNR")
     ogi   = _omean("inference_gpu_s")
     lines.append(f"\n{'='*80}")
     lines.append(f"  Overall Mean ({n_all} categories, N={N_RUNS} runs each)")
     lines.append(f"{'='*80}")
     lines.append(f"  Img AUROC : {oi:.2f}%   Pxl AUROC : {op:.2f}%   AUPRO : {opr:.2f}%")
     lines.append(f"  Img F1Max : {of1i:.2f}%   Pxl F1Max : {of1p:.2f}%")
-    lines.append(f"  Img FNR   : {ofnri:.2f}%   Pxl FNR   : {ofnrp:.2f}%")
     lines.append(f"  GPU inf   : {ogi:.3f}s")
 
 # ── OOM section in results file ───────────────────────────────

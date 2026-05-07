@@ -40,7 +40,7 @@ from anomalib.data import MVTecAD
 from anomalib.data.datasets.image.mvtecad import MVTecADDataset
 from anomalib.data.utils import Split
 from anomalib.engine import Engine
-from anomalib.metrics import AUPRO, AUROC, AnomalibMetric, Evaluator
+from anomalib.metrics import AUPRO, AUROC, Evaluator
 from anomalib.models import Dinomaly
 from lightning.pytorch.callbacks import TQDMProgressBar
 
@@ -51,46 +51,6 @@ try:
     HAS_F1MAX = True
 except ImportError:
     HAS_F1MAX = False
-
-try:
-    from torchmetrics import Metric as _TMMetric
-
-    class _FNRBase(_TMMetric):
-        higher_is_better: bool = False
-        full_state_update: bool = False
-
-        def __init__(self, num_thresh: int = 200, **kwargs):
-            super().__init__(**kwargs)
-            self._num_thresh = num_thresh
-            self.add_state("preds",  default=[], dist_reduce_fx="cat")
-            self.add_state("labels", default=[], dist_reduce_fx="cat")
-
-        def update(self, preds, target) -> None:
-            self.preds.append(preds.float().detach().flatten())
-            self.labels.append(target.float().detach().flatten())
-
-        def compute(self) -> torch.Tensor:
-            p  = torch.cat(self.preds)
-            lb = torch.cat(self.labels).long()
-            ts = torch.linspace(p.min(), p.max(), self._num_thresh, device=p.device)
-            best_fnr, best_f1 = torch.tensor(1.0, device=p.device), -1.0
-            for t in ts:
-                pb = (p >= t).long()
-                tp = ((pb == 1) & (lb == 1)).sum().float()
-                fp = ((pb == 1) & (lb == 0)).sum().float()
-                fn = ((pb == 0) & (lb == 1)).sum().float()
-                f1 = 2 * tp / (2 * tp + fp + fn + 1e-8)
-                if f1.item() > best_f1:
-                    best_f1 = f1.item()
-                    best_fnr = fn / (fn + tp + 1e-8)
-            return best_fnr
-
-    class FNR(AnomalibMetric, _FNRBase):
-        pass
-
-    HAS_FNR = True
-except Exception:
-    HAS_FNR = False
 
 # ── Config ────────────────────────────────────────────────────
 N_RUNS: int = int(sys.argv[1]) if len(sys.argv) > 1 else 1
@@ -154,11 +114,6 @@ def make_evaluator():
         metrics += [
             F1Max(fields=["pred_score", "gt_label"], prefix="image_"),
             F1Max(fields=["anomaly_map", "gt_mask"], prefix="pixel_"),
-        ]
-    if HAS_FNR:
-        metrics += [
-            FNR(fields=["pred_score", "gt_label"], prefix="image_"),
-            FNR(fields=["anomaly_map", "gt_mask"], prefix="pixel_"),
         ]
     return Evaluator(test_metrics=metrics)
 
@@ -283,8 +238,6 @@ for run_idx in range(N_RUNS):
         pxl_pro  = m.get("pixel_AUPRO", 0) * 100
         img_f1   = (m["image_F1Max"] * 100) if m.get("image_F1Max") is not None else None
         pxl_f1   = (m["pixel_F1Max"] * 100) if m.get("pixel_F1Max") is not None else None
-        img_fnr  = (m["image_FNR"] * 100) if m.get("image_FNR") is not None else None
-        pxl_fnr  = (m["pixel_FNR"] * 100) if m.get("pixel_FNR") is not None else None
         print(f"    Img AUROC {img_auc:.1f}%  Pxl AUROC {pxl_auc:.1f}%  AUPRO {pxl_pro:.1f}%"
               f"  ({elapsed:.1f}s)")
 
@@ -294,8 +247,6 @@ for run_idx in range(N_RUNS):
             "pixel_AUPRO":     pxl_pro,
             "image_F1Max":     img_f1,
             "pixel_F1Max":     pxl_f1,
-            "image_FNR":       img_fnr,
-            "pixel_FNR":       pxl_fnr,
             "n_params":        n_params,
             "inference_gpu_s": elapsed,
             "train_secs":      train_secs,
@@ -341,7 +292,7 @@ lines.append(f"  Encoder: {ENCODER}  |  one model jointly on {len(MVTEC_CATEGORI
 lines.append(SEP)
 
 HDR = (f"{'Category':<15} {'Img AUROC':>{C}} {'Pxl AUROC':>{C}} {'AUPRO':>{C}}"
-       f" {'Img F1Max':>{C}} {'Pxl F1Max':>{C}} {'Img FNR':>{C}} {'Pxl FNR':>{C}}")
+       f" {'Img F1Max':>{C}} {'Pxl F1Max':>{C}}")
 lines.append(HDR)
 lines.append("-" * len(HDR))
 
@@ -351,8 +302,7 @@ for cat in MVTEC_CATEGORIES:
     if not runs:
         continue
     r = {k: (_mean(runs, k), _std(runs, k)) for k in
-         ("image_AUROC", "pixel_AUROC", "pixel_AUPRO", "image_F1Max", "pixel_F1Max",
-          "image_FNR", "pixel_FNR")}
+         ("image_AUROC", "pixel_AUROC", "pixel_AUPRO", "image_F1Max", "pixel_F1Max")}
     cat_avg[cat] = {k: v[0] for k, v in r.items()}
     lines.append(
         f"{cat:<15}"
@@ -361,14 +311,12 @@ for cat in MVTEC_CATEGORIES:
         f" {_fmt(*r['pixel_AUPRO']):>{C}}"
         f" {_fmt(*r['image_F1Max']):>{C}}"
         f" {_fmt(*r['pixel_F1Max']):>{C}}"
-        f" {_fmt(*r['image_FNR']):>{C}}"
-        f" {_fmt(*r['pixel_FNR']):>{C}}"
     )
 
 if cat_avg:
     avg = {k: statistics.mean(v for v in (c[k] for c in cat_avg.values()) if v == v)
            for k in ("image_AUROC", "pixel_AUROC", "pixel_AUPRO",
-                     "image_F1Max", "pixel_F1Max", "image_FNR", "pixel_FNR")}
+                     "image_F1Max", "pixel_F1Max")}
     lines.append("-" * len(HDR))
     lines.append(
         f"{'MEAN':<15}"
@@ -377,8 +325,6 @@ if cat_avg:
         f" {avg['pixel_AUPRO']:>{C}.1f}"
         f" {avg['image_F1Max']:>{C}.1f}"
         f" {avg['pixel_F1Max']:>{C}.1f}"
-        f" {avg['image_FNR']:>{C}.1f}"
-        f" {avg['pixel_FNR']:>{C}.1f}"
     )
 
 lines.append("=" * 80)
