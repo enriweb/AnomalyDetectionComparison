@@ -265,7 +265,7 @@ for ds_idx, (ds_name, DataModule, categories, root) in enumerate(DATASETS, 1):
                 print(f"  → Building model (EfficientAD-{VARIANT.upper()})...")
                 model = EfficientAd(
                     # (§3.2): "we sample a random image P from the pretraining dataset"
-                    imagenet_dir="./datasets/imagenette",
+                    # imagenet_dir="./datasets/imagenette",
                     # (Fig.2): PDN output channels = 384
                     teacher_out_channels=384,
                     # (supplementary): learning rate = 1e-4
