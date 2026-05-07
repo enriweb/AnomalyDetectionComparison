@@ -43,7 +43,7 @@ print("Importing torch-related libraries...")
 import torch
 from anomalib.data import MVTecAD, Visa
 from anomalib.engine import Engine
-from anomalib.metrics import AUPRO, AUROC, Evaluator
+from anomalib.metrics import AUPRO, AUROC, AnomalibMetric, Evaluator
 from anomalib.models import Dinomaly
 from lightning.pytorch.callbacks import TQDMProgressBar
 
@@ -60,22 +60,20 @@ except ImportError:
 try:
     from torchmetrics import Metric as _TMMetric
 
-    class FNR(_TMMetric):
+    class _FNRBase(_TMMetric):
         """False Negative Rate at the threshold that maximises F1."""
         higher_is_better: bool = False
         full_state_update: bool = False
 
-        def __init__(self, fields: list[str], prefix: str = "", num_thresh: int = 200):
-            super().__init__()
-            self.fields = fields
-            self.prefix = prefix
+        def __init__(self, num_thresh: int = 200, **kwargs):
+            super().__init__(**kwargs)
             self._num_thresh = num_thresh
             self.add_state("preds",  default=[], dist_reduce_fx="cat")
             self.add_state("labels", default=[], dist_reduce_fx="cat")
 
-        def update(self, **kwargs) -> None:
-            self.preds.append(kwargs[self.fields[0]].float().detach().flatten())
-            self.labels.append(kwargs[self.fields[1]].float().detach().flatten())
+        def update(self, preds, target) -> None:
+            self.preds.append(preds.float().detach().flatten())
+            self.labels.append(target.float().detach().flatten())
 
         def compute(self) -> torch.Tensor:
             p  = torch.cat(self.preds)
@@ -92,6 +90,9 @@ try:
                     best_f1 = f1.item()
                     best_fnr = fn / (fn + tp + 1e-8)
             return best_fnr
+
+    class FNR(AnomalibMetric, _FNRBase):
+        pass
 
     HAS_FNR = True
 except Exception:
