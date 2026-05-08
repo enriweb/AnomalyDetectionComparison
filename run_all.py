@@ -33,8 +33,8 @@ SCRIPTS = {
     "patchcore":  "patchcore.py",
     "efficientad": "efficientAD.py",
     "cfa":        "cfa.py",
-    "uninet":     "uninet.py",
-    "dinomaly":   "dinomaly.py",
+    "vitad":      "vitad.py",
+    "dinomaly2":  "dinomaly2.py",
     "mobilevit":  "mobilevit.py",
     "hybridcore": "hybridcore.py",
 }

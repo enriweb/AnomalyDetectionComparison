@@ -9,7 +9,7 @@ Usage:
     python dinomaly_muad.py          # 1 run (default)
     python dinomaly_muad.py 3        # 3 runs, results averaged
 
-Differences vs. dinomaly.py (per-category sibling):
+Differences vs. dinomaly2.py (per-category sibling):
   • Trains a single model on a merged datamodule (all MVTec categories
     concatenated via the dataset's __add__ operator).
   • Eval loop iterates per-category by constructing a fresh MVTecAD

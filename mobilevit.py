@@ -9,7 +9,7 @@ Metrics recorded per run:
     Accuracy  — image AUROC, pixel AUROC, pixel AUPRO,
                 image F1Max (optimal threshold), pixel F1Max
     Efficiency — n_params, FLOPs (backbone, thop optional),
-                 inference time GPU + CPU (MobileViT-S backbone),
+                 inference time GPU (MobileViT-S backbone),
                  peak + mean GPU MB
 
 Progress is checkpointed to results/mobilevit_progress.json after every
@@ -255,32 +255,6 @@ for ds_idx, (ds_name, DataModule, categories, root) in enumerate(DATASETS, 1):
                     except Exception:
                         pass
 
-                # ── CPU inference: backbone on 1 image ────────────────
-                inference_cpu_s = None
-                try:
-                    print(f"  → Timing CPU inference (backbone, 1 image × 5 runs)...")
-                    _feat = model.model.feature_extractor.cpu().eval()
-                    _dev = next(_feat.parameters()).device
-                    if str(_dev) != "cpu":
-                        raise RuntimeError(f"Backbone still on {_dev} after .cpu()")
-                    _dummy_cpu = torch.randn(1, 3, 224, 224)
-                    for _ in range(3):
-                        with torch.no_grad():
-                            _feat(_dummy_cpu)
-                    _times = []
-                    for _ in range(5):
-                        _t = time.perf_counter()
-                        with torch.no_grad():
-                            _feat(_dummy_cpu)
-                        _times.append(time.perf_counter() - _t)
-                    inference_cpu_s = round(statistics.mean(_times), 4)
-                    print(f"  → CPU inference: {inference_cpu_s:.4f}s (avg 5 runs)")
-                    del _dummy_cpu
-                    if torch.cuda.is_available():
-                        model.model.feature_extractor.cuda()
-                except Exception as _cpu_err:
-                    print(f"  [WARN] CPU timing failed: {_cpu_err}")
-
                 # ── GPU inference with peak + mean VRAM tracking ─────
                 print(f"  → Running inference on test set (GPU)...")
                 _gpu_samples: list = []
@@ -324,7 +298,6 @@ for ds_idx, (ds_name, DataModule, categories, root) in enumerate(DATASETS, 1):
                     "n_params":        n_params,
                     "flops_M":         flops_M,
                     "inference_gpu_s": elapsed_gpu,
-                    "inference_cpu_s": inference_cpu_s,
                     "peak_gpu_mb":     peak_gpu_mb,
                     "mean_gpu_mb":     mean_gpu_mb,
                 })
@@ -437,7 +410,7 @@ for ds_name, _, categories, _ in DATASETS:
     # ── Efficiency table ──────────────────────────────────────
     lines.append(f"\n--- {label} — Efficiency ---")
     HDR_E = (f"{'Category':<15} {'Params':>{CE}} {'FLOPs(M)':>{CE}}"
-             f" {'GPU inf(s)':>{CE}} {'CPU inf(s)':>{CE}}"
+             f" {'GPU inf(s)':>{CE}}"
              f" {'PkGPU(MB)':>{CE}} {'MnGPU(MB)':>{CE}}")
     lines.append(HDR_E)
     lines.append("-" * len(HDR_E))
@@ -453,17 +426,15 @@ for ds_name, _, categories, _ in DATASETS:
         np_  = _mean(runs, "n_params")
         fl_  = _mean(runs, "flops_M")
         gi_  = _mean(runs, "inference_gpu_s")
-        ci_  = _mean(runs, "inference_cpu_s")
         pgm_ = _mean(runs, "peak_gpu_mb")
         mgm_ = _mean(runs, "mean_gpu_mb")
-        cat_eff[cat] = {"np": np_, "fl": fl_, "gpu": gi_, "cpu": ci_,
+        cat_eff[cat] = {"np": np_, "fl": fl_, "gpu": gi_,
                         "pgm": pgm_, "mgm": mgm_}
         lines.append(
             f"{cat:<15}"
             f" {_fe(np_,  '{:,.0f}')}"
             f" {_fe(fl_,  '{:.1f}')}"
             f" {_fe(gi_,  '{:.3f}')}"
-            f" {_fe(ci_,  '{:.4f}')}"
             f" {_fe(pgm_, '{:.1f}')}"
             f" {_fe(mgm_, '{:.1f}')}"
         )
@@ -479,7 +450,6 @@ for ds_name, _, categories, _ in DATASETS:
             f" {_fe(_first['np'],  '{:,.0f}')}"
             f" {_fe(_first['fl'],  '{:.1f}')}"
             f" {_fe(_avg_eff('gpu'), '{:.3f}')}"
-            f" {_fe(_avg_eff('cpu'), '{:.4f}')}"
             f" {_fe(_avg_eff('pgm'), '{:.1f}')}"
             f" {_fe(_avg_eff('mgm'), '{:.1f}')}"
         )
