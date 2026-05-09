@@ -272,7 +272,7 @@ for ds_idx, (ds_name, DataModule, categories, root) in enumerate(DATASETS, 1):
                 print(f"  -> Parameters: {n_params:,}")
 
                 print(f"  -> Training (max_steps={TRAIN_STEPS})...")
-                engine = Engine(max_steps=TRAIN_STEPS, devices="auto", strategy="ddp", logger=False, callbacks=[CompactBar()])
+                engine = Engine(max_steps=TRAIN_STEPS, devices="auto", strategy="auto", logger=False, callbacks=[CompactBar()])
                 engine.fit(model=model, datamodule=datamodule)
                 print("  -> Training complete.")
 

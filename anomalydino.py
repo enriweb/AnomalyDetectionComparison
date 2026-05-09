@@ -205,7 +205,7 @@ for ds_idx, (ds_name, DataModule, categories, root) in enumerate(DATASETS, 1):
                 print(f"  -> Parameters: {n_params:,}")
 
                 print(f"  -> Building memory bank (coreset)...")
-                engine = Engine(max_epochs=1, devices="auto", strategy="ddp", logger=False, callbacks=[CompactBar()])
+                engine = Engine(max_epochs=1, devices="auto", strategy="auto", logger=False, callbacks=[CompactBar()])
                 engine.fit(model=model, datamodule=datamodule)
                 print(f"  -> Memory bank built.")
 
