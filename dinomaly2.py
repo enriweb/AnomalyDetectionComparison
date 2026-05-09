@@ -67,7 +67,7 @@ MAX_VRAM_GB: float = 0  # reserved VRAM limit before each run; 0 = disabled
 ENCODER = "dinov2reg_vit_base_14"
 BOTTLENECK_DROPOUT = 0.2
 DECODER_DEPTH = 8
-TRAIN_STEPS = 5000
+TRAIN_STEPS = 40000  # paper protocol (Guo+ 2025, Table I)
 IMAGE_SIZE = (448, 448)
 CROP_SIZE = 392
 TRAIN_BATCH_SIZE = 16
@@ -242,7 +242,6 @@ for ds_idx, (ds_name, DataModule, categories, root) in enumerate(DATASETS, 1):
                     fuse_layer_encoder=FUSE_LAYER_ENCODER,
                     fuse_layer_decoder=FUSE_LAYER_DECODER,
                     remove_class_token=False,
-                    use_context_recentering=USE_CONTEXT_RECENTERING,
                     pre_processor=Dinomaly.configure_pre_processor(
                         image_size=IMAGE_SIZE,
                         crop_size=CROP_SIZE,
@@ -251,11 +250,29 @@ for ds_idx, (ds_name, DataModule, categories, root) in enumerate(DATASETS, 1):
                     visualizer=False,
                 )
 
+                # Context-Aware Recentering (Dinomaly2 paper, Sec 3.4, Eq.12):
+                # Subtract class token from patch tokens before reconstruction.
+                if USE_CONTEXT_RECENTERING:
+                    _orig_encoder_forward = model.model.encoder.forward
+
+                    def _recentered_forward(x):
+                        result = _orig_encoder_forward(x)
+                        if isinstance(result, dict):
+                            for k in list(result.keys()):
+                                v = result[k]
+                                if isinstance(v, torch.Tensor) and v.dim() == 3 and v.shape[1] > 1:
+                                    cls = v[:, 0:1, :]
+                                    result[k] = torch.cat([cls, v[:, 1:, :] - cls], dim=1)
+                        return result
+
+                    model.model.encoder.forward = _recentered_forward
+                    print("  -> Context-aware recentering applied (encoder monkey-patch).")
+
                 n_params = sum(p.numel() for p in model.parameters())
                 print(f"  -> Parameters: {n_params:,}")
 
                 print(f"  -> Training (max_steps={TRAIN_STEPS})...")
-                engine = Engine(max_steps=TRAIN_STEPS, logger=False, callbacks=[CompactBar()])
+                engine = Engine(max_steps=TRAIN_STEPS, devices="auto", strategy="ddp", logger=False, callbacks=[CompactBar()])
                 engine.fit(model=model, datamodule=datamodule)
                 print("  -> Training complete.")
 

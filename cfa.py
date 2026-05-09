@@ -222,7 +222,7 @@ for ds_idx, (ds_name, DataModule, categories, root) in enumerate(DATASETS, 1):
 
                 print(f"  → Training (30 epochs)...")
                 # (§4.1): "Patch descriptor was trained for 30 epochs"
-                engine = Engine(max_epochs=30, logger=False, callbacks=[CompactBar()])
+                engine = Engine(max_epochs=30, devices="auto", strategy="ddp", logger=False, callbacks=[CompactBar()])
                 engine.fit(model=model, datamodule=datamodule)
                 print(f"  → Training complete.")
 

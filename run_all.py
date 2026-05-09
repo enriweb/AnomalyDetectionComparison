@@ -30,13 +30,12 @@ from datetime import datetime
 
 # ── Available scripts (order = default sequential order) ─────
 SCRIPTS = {
-    "patchcore":  "patchcore.py",
+    "patchcore":   "patchcore.py",
     "efficientad": "efficientAD.py",
-    "cfa":        "cfa.py",
-    "vitad":      "vitad.py",
-    "dinomaly2":  "dinomaly2.py",
-    "mobilevit":  "mobilevit.py",
-    "hybridcore": "hybridcore.py",
+    "cfa":         "cfa.py",
+    "dinomaly2":   "dinomaly2.py",
+    "mobilevit":   "mobilevit.py",
+    "anomalydino": "anomalydino.py",
 }
 
 # ── CLI ───────────────────────────────────────────────────────
