@@ -63,6 +63,8 @@ try:
 except ImportError:
     HAS_THOP = False
 
+from utils.efficiency import measure_all
+
 # -- Config ------------------------------------------------------------------
 N_RUNS: int = int(sys.argv[1]) if len(sys.argv) > 1 else 1
 MAX_VRAM_GB: float = 0  # reserved VRAM limit before each run; 0 = disabled
@@ -276,6 +278,20 @@ for ds_idx, (ds_name, DataModule, categories, root) in enumerate(DATASETS, 1):
                     except Exception:
                         pass
 
+                eff_extra = None
+                try:
+                    eff_extra = measure_all(
+                        model.model.backbone,
+                        input_shape=(1, 3, 224, 224),
+                        device="cuda" if torch.cuda.is_available() else "cpu",
+                        skip_flops=True,
+                        gpu_batch=8,
+                    )
+                    print(f"  -> GPU throughput: {eff_extra.get('gpu_throughput'):.1f} img/s"
+                          f"  |  CPU latency: {eff_extra.get('cpu_latency_ms'):.1f} ms")
+                except Exception as e:
+                    print(f"  [warn] measure_all failed: {e}")
+
                 # -- GPU inference with peak + mean VRAM tracking ------------
                 print("  -> Running inference on test set (GPU)...")
                 _gpu_samples: list = []
@@ -312,22 +328,25 @@ for ds_idx, (ds_name, DataModule, categories, root) in enumerate(DATASETS, 1):
                     f"  |  Mean GPU: {mean_gpu_mb:.1f} MB"
                 )
 
-                results[ds_name][category].append(
-                    {
-                        # -- Accuracy ---------------------------------------
-                        "image_AUROC": img_auc,
-                        "pixel_AUROC": pxl_auc,
-                        "pixel_AUPRO": pxl_pro,
-                        "image_F1Max": img_f1,
-                        "pixel_F1Max": pxl_f1,
-                        # -- Efficiency -------------------------------------
-                        "n_params": n_params,
-                        "flops_M": flops_M,
-                        "inference_gpu_s": elapsed_gpu,
-                        "peak_gpu_mb": peak_gpu_mb,
-                        "mean_gpu_mb": mean_gpu_mb,
-                    }
-                )
+                run_record = {
+                    # -- Accuracy ---------------------------------------
+                    "image_AUROC": img_auc,
+                    "pixel_AUROC": pxl_auc,
+                    "pixel_AUPRO": pxl_pro,
+                    "image_F1Max": img_f1,
+                    "pixel_F1Max": pxl_f1,
+                    # -- Efficiency -------------------------------------
+                    "n_params": n_params,
+                    "flops_M": flops_M,
+                    "inference_gpu_s": elapsed_gpu,
+                    "peak_gpu_mb": peak_gpu_mb,
+                    "mean_gpu_mb": mean_gpu_mb,
+                }
+                if eff_extra:
+                    run_record["gpu_throughput"] = eff_extra.get("gpu_throughput")
+                    run_record["cpu_latency_ms"] = eff_extra.get("cpu_latency_ms")
+                    run_record["peak_gpu_mem_b"] = eff_extra.get("peak_gpu_mem")
+                results[ds_name][category].append(run_record)
 
                 with open(PROGRESS_FILE, "w") as f:
                     json.dump(results, f, indent=2)
