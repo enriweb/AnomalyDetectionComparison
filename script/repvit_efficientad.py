@@ -42,32 +42,14 @@ from anomalib.models import EfficientAd
 from anomalib.models.image.efficient_ad.torch_model import (
     EfficientAdModel, EfficientAdModelSize, AutoEncoder, imagenet_norm_batch,
 )
+from anomalib.metrics import F1Max
 from lightning.pytorch.callbacks import TQDMProgressBar
+from torch.utils.flop_counter import FlopCounterMode
 import timm
-
-try:
-    from anomalib.metrics import F1Max
-    HAS_F1MAX = True
-except ImportError:
-    HAS_F1MAX = False
-
-try:
-    from thop import profile as _thop_profile
-    HAS_THOP = True
-except ImportError:
-    HAS_THOP = False
-
 import pandas as pd
 
 # ── Config ────────────────────────────────────────────────────
-N_RUNS: int        = int(sys.argv[1]) if len(sys.argv) > 1 else 1
-TEACHER_BACKBONE   = "repvit_m1"
-STUDENT_BACKBONE   = "repvit_m0_9"
-TEACHER_OUT_CH     = 384
-IMAGE_SIZE         = (256, 256)
-MAX_EPOCHS         = 20
-LR                 = 1e-4
-WEIGHT_DECAY       = 1e-5
+N_RUNS: int = int(sys.argv[1]) if len(sys.argv) > 1 else 1
 torch.set_float32_matmul_precision("high")
 
 
@@ -195,11 +177,11 @@ class RepViTEfficientAdModel(EfficientAdModel):
     """EfficientAdModel with RepViT teacher + student replacing PDN-S."""
     def __init__(
         self,
-        teacher_out_channels: int = TEACHER_OUT_CH,
+        teacher_out_channels: int = 384,
         padding: bool = True,
         pad_maps: bool = False,
-        teacher_backbone: str = TEACHER_BACKBONE,
-        student_backbone: str = STUDENT_BACKBONE,
+        teacher_backbone: str = "repvit_m1",
+        student_backbone: str = "repvit_m0_9",
     ) -> None:
         # Bypass parent init: we don't want PDN-S teacher/student built.
         nn.Module.__init__(self)
@@ -250,11 +232,11 @@ class RepViTEfficientAd(EfficientAd):
     def __init__(
         self,
         imagenet_dir: str = "./datasets/imagenette",
-        teacher_out_channels: int = TEACHER_OUT_CH,
+        teacher_out_channels: int = 384,
         padding: bool = True,
         pad_maps: bool = False,
-        lr: float = LR,
-        weight_decay: float = WEIGHT_DECAY,
+        lr: float = 1e-4,
+        weight_decay: float = 1e-5,
         **kw,
     ) -> None:
         super().__init__(
@@ -271,8 +253,8 @@ class RepViTEfficientAd(EfficientAd):
             teacher_out_channels=teacher_out_channels,
             padding=padding,
             pad_maps=pad_maps,
-            teacher_backbone=TEACHER_BACKBONE,
-            student_backbone=STUDENT_BACKBONE,
+            teacher_backbone="repvit_m1",
+            student_backbone="repvit_m0_9",
         )
 
     def prepare_pretrained_model(self) -> None:
@@ -303,12 +285,10 @@ PROGRESS_FILE = "results/repvit_efficientad_progress.json"
 
 # ── Startup banner ────────────────────────────────────────────
 print("=" * 60)
-print("  RepViT-EfficientAD  (N={N_RUNS}, Teacher: {TEACHER_BACKBONE}, Student: {STUDENT_BACKBONE})")
-print(f"  teacher_out={TEACHER_OUT_CH}  padding=True  epochs={MAX_EPOCHS}")
+print(f"  RepViT-EfficientAD  (N={N_RUNS}, Teacher: repvit_m1, Student: repvit_m0_9)")
+print("  teacher_out=384  padding=True  epochs=20")
 print(f"  Runs per category : {N_RUNS}")
 print(f"  Categories total  : {total_categories}  ({len(MVTEC_CATEGORIES)} MVTec + {len(VISA_CATEGORIES)} VisA)")
-print(f"  FLOPs (thop)      : {'available' if HAS_THOP else 'not installed — skipped'}")
-print(f"  F1Max metric      : {'available' if HAS_F1MAX else 'not in this anomalib version — skipped'}")
 gpu_info = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU only"
 print(f"  Device            : {gpu_info}")
 print("=" * 60)
@@ -363,22 +343,20 @@ for run in range(N_RUNS):
                 image_auroc = AUROC(fields=["pred_score", "gt_label"], prefix="image_")
                 pixel_auroc = AUROC(fields=["anomaly_map", "gt_mask"],  prefix="pixel_")
                 pixel_pro   = AUPRO(fields=["anomaly_map", "gt_mask"],  prefix="pixel_")
-                test_metrics = [image_auroc, pixel_auroc, pixel_pro]
-                if HAS_F1MAX:
-                    image_f1max = F1Max(fields=["pred_score", "gt_label"], prefix="image_")
-                    pixel_f1max = F1Max(fields=["anomaly_map", "gt_mask"],  prefix="pixel_")
-                    test_metrics += [image_f1max, pixel_f1max]
-                evaluator = Evaluator(test_metrics=test_metrics)
+                image_f1max = F1Max(fields=["pred_score", "gt_label"], prefix="image_")
+                pixel_f1max = F1Max(fields=["anomaly_map", "gt_mask"],  prefix="pixel_")
+                evaluator = Evaluator(test_metrics=[image_auroc, pixel_auroc, pixel_pro,
+                                                    image_f1max, pixel_f1max])
 
-                print(f"  → Building model ({TEACHER_BACKBONE} + {STUDENT_BACKBONE})...")
+                print("  → Building model (repvit_m1 + repvit_m0_9)...")
                 model = RepViTEfficientAd(
                     imagenet_dir="./datasets/imagenette",
-                    teacher_out_channels=TEACHER_OUT_CH,
+                    teacher_out_channels=384,
                     padding=True,
                     pad_maps=False,
-                    lr=LR,
-                    weight_decay=WEIGHT_DECAY,
-                    pre_processor=EfficientAd.configure_pre_processor(image_size=IMAGE_SIZE),
+                    lr=1e-4,
+                    weight_decay=1e-5,
+                    pre_processor=EfficientAd.configure_pre_processor(image_size=(256, 256)),
                     evaluator=evaluator,
                     visualizer=False,
                 )
@@ -386,31 +364,27 @@ for run in range(N_RUNS):
                 n_params = sum(p.numel() for p in model.parameters())
                 print(f"  → Parameters: {n_params:,}")
 
-                print(f"  → Training ({MAX_EPOCHS} epochs)...")
-                engine = Engine(max_epochs=MAX_EPOCHS, devices="auto", strategy="auto",
+                print("  → Training (20 epochs)...")
+                engine = Engine(max_epochs=20, devices="auto", strategy="auto",
                                 logger=False, callbacks=[CompactBar()])
                 engine.fit(model=model, datamodule=datamodule)
 
-                # ── FLOPs: teacher backbone forward pass on one image ─────────
+                # ── FLOPs: teacher backbone forward pass on one image (PyTorch native) ─────────
                 flops_M = None
-                if HAS_THOP:
-                    try:
-                        device = next(model.parameters()).device
-                        _dummy = torch.randn(1, 3, IMAGE_SIZE[0], IMAGE_SIZE[1], device=device)
-                        with warnings.catch_warnings():
-                            warnings.simplefilter("ignore")
-                            _flops, _ = _thop_profile(
-                                model.model.teacher, inputs=(_dummy,), verbose=False
-                            )
-                        flops_M = round(_flops / 1e6, 1)
-                        print(f"  → Teacher FLOPs: {flops_M:.1f} M")
-                        del _dummy
-                    except Exception:
-                        pass
+                try:
+                    device = next(model.parameters()).device
+                    _dummy = torch.randn(1, 3, 256, 256, device=device)
+                    with FlopCounterMode(display=False) as fcm:
+                        _ = model.model.teacher(_dummy)
+                    flops_M = round(fcm.get_total_flops() / 1e6, 1)
+                    print(f"  → Teacher FLOPs: {flops_M:.1f} M")
+                    del _dummy
+                except Exception:
+                    pass
 
                 # ── Throughput, CPU latency, single-forward peak mem ─────────
                 extractor = model.model.teacher
-                input_shape = (1, 3, IMAGE_SIZE[0], IMAGE_SIZE[1])
+                input_shape = (1, 3, 256, 256)
 
                 try:
                     gpu_tput = _gpu_throughput(extractor, input_shape=input_shape, batch=8)
@@ -565,7 +539,7 @@ pieces.append(_align(overall_df, display_cols))
 summary = pd.concat(pieces)
 
 print(f"\n{'=' * 140}")
-print(f"  RepViT-EfficientAD  (N={N_RUNS}, Teacher: {TEACHER_BACKBONE}, Student: {STUDENT_BACKBONE})")
+print(f"  RepViT-EfficientAD  (N={N_RUNS}, Teacher: repvit_m1, Student: repvit_m0_9)")
 print(f"  Raw CSV: {csv_path}")
 print(f"{'=' * 140}")
 print(summary.to_string(float_format=lambda x: f"{x:.1f}" if pd.notna(x) else "—"))

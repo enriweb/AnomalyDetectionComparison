@@ -56,12 +56,6 @@ import pandas as pd
 # ── Config ────────────────────────────────────────────────────
 N_RUNS: int = int(sys.argv[1]) if len(sys.argv) > 1 else 1
 
-CNN_BACKBONE  = "wide_resnet50_2"
-CNN_LAYERS    = ["layer2", "layer3"]
-VIT_NAME      = "deit_tiny_patch16_224"
-CORESET_RATIO = 0.25
-NUM_NEIGHBORS = 9
-
 torch.set_float32_matmul_precision('high')
 
 # ── GPU cleanup helper ────────────────────────────────────────
@@ -154,9 +148,9 @@ class HybridCoreModel(PatchcoreModel):
     Embedding dim: 1536 (CNN) + 192 (ViT) = 1728.
     """
 
-    def __init__(self, vit_name: str = VIT_NAME, **kwargs) -> None:
+    def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
-        self.vit = timm.create_model(vit_name, pretrained=True).eval()
+        self.vit = timm.create_model("deit_tiny_patch16_224", pretrained=True).eval()
         for p in self.vit.parameters():
             p.requires_grad_(False)
 
@@ -212,10 +206,10 @@ class HybridCore(Patchcore):
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
         self.model = HybridCoreModel(
-            backbone=CNN_BACKBONE,
+            backbone="wide_resnet50_2",
             pre_trained=True,
-            layers=CNN_LAYERS,
-            num_neighbors=NUM_NEIGHBORS,
+            layers=["layer2", "layer3"],
+            num_neighbors=9,
         )
 
 
@@ -242,8 +236,8 @@ PROGRESS_FILE = "results/hybridcore_progress.json"
 
 # ── Startup banner ────────────────────────────────────────────
 print("=" * 60)
-print(f"  HybridCore  |  CNN: {CNN_BACKBONE} {CNN_LAYERS}  |  ViT: {VIT_NAME}")
-print(f"  Coreset: {CORESET_RATIO*100:.0f}%  |  Neighbors: {NUM_NEIGHBORS}  |  Emb: 1536+192=1728")
+print("  HybridCore  |  CNN: wide_resnet50_2 [layer2, layer3]  |  ViT: deit_tiny_patch16_224")
+print("  Coreset: 25%  |  Neighbors: 9  |  Emb: 1536+192=1728")
 print(f"  Runs per category : {N_RUNS}")
 print(f"  Categories total  : {total_categories}  ({len(MVTEC_CATEGORIES)} MVTec + {len(VISA_CATEGORIES)} VisA)")
 gpu_info = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU only"
@@ -307,11 +301,11 @@ for run in range(N_RUNS):
 
                 print(f"  → Building model (WRN50 + DeiT-Tiny)...")
                 model = HybridCore(
-                    backbone=CNN_BACKBONE,
-                    layers=CNN_LAYERS,
+                    backbone="wide_resnet50_2",
+                    layers=["layer2", "layer3"],
                     pre_trained=True,
-                    coreset_sampling_ratio=CORESET_RATIO,
-                    num_neighbors=NUM_NEIGHBORS,
+                    coreset_sampling_ratio=0.25,
+                    num_neighbors=9,
                     pre_processor=Patchcore.configure_pre_processor(
                         image_size=(256, 256),
                         center_crop_size=(224, 224),
@@ -499,7 +493,7 @@ pieces.append(_align(overall_df, display_cols))
 summary = pd.concat(pieces)
 
 print(f"\n{'=' * 140}")
-print(f"  HybridCore  (N={N_RUNS}, CNN: {CNN_BACKBONE} {CNN_LAYERS}, ViT: {VIT_NAME}, Coreset: {CORESET_RATIO*100:.0f}%)")
+print(f"  HybridCore  (N={N_RUNS}, CNN: wide_resnet50_2 [layer2, layer3], ViT: deit_tiny_patch16_224, Coreset: 25%)")
 print(f"  Raw CSV: {csv_path}")
 print(f"{'=' * 140}")
 print(summary.to_string(float_format=lambda x: f"{x:.1f}" if pd.notna(x) else "—"))

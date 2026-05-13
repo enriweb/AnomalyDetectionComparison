@@ -30,36 +30,18 @@ for _log in ("lightning", "lightning.pytorch", "anomalib", "torchvision", "torch
     logging.getLogger(_log).setLevel(logging.ERROR)
 print("Importing torch-related libraries")
 import torch
+import torch.nn as nn
 from anomalib.data import MVTecAD, Visa
 from anomalib.engine import Engine
-from anomalib.metrics import AUPRO, AUROC, Evaluator
+from anomalib.metrics import AUPRO, AUROC, F1Max, Evaluator
 from anomalib.models import Patchcore
 from anomalib.models.image.patchcore.torch_model import PatchcoreModel
 from lightning.pytorch.callbacks import TQDMProgressBar
-
-try:
-    from anomalib.metrics import F1Max
-    HAS_F1MAX = True
-except ImportError:
-    HAS_F1MAX = False
-
-try:
-    from thop import profile as _thop_profile
-    HAS_THOP = True
-except ImportError:
-    HAS_THOP = False
-
+from torch.utils.flop_counter import FlopCounterMode
 import pandas as pd
 
 # ── Config ────────────────────────────────────────────────────
-N_RUNS: int        = int(sys.argv[1]) if len(sys.argv) > 1 else 1
-BACKBONE           = "fastvit_sa12"
-LAYERS             = ["stages.2", "stages.3"]
-CORESET_RATIO      = 0.25
-NUM_NEIGHBORS      = 9
-IMAGE_SIZE         = (256, 256)
-CENTER_CROP        = (224, 224)
-MAX_VRAM_GB: float = 0
+N_RUNS: int = int(sys.argv[1]) if len(sys.argv) > 1 else 1
 torch.set_float32_matmul_precision("high")
 
 
@@ -162,11 +144,9 @@ os.makedirs("results", exist_ok=True)
 PROGRESS_FILE = "results/fastvit_patchcore_progress.json"
 
 print("=" * 60)
-print(f"  FastViT-PatchCore  |  {BACKBONE}  |  Layers {LAYERS}  |  Coreset {int(CORESET_RATIO*100)}%")
+print("  FastViT-PatchCore  |  fastvit_sa12  |  Layers [stages.2, stages.3]  |  Coreset 25%")
 print(f"  Runs per category : {N_RUNS}")
 print(f"  Categories total  : {total_categories}  ({len(MVTEC_CATEGORIES)} MVTec + {len(VISA_CATEGORIES)} VisA)")
-print(f"  FLOPs (thop)      : {'available' if HAS_THOP else 'not installed — skipped'}")
-print(f"  F1Max metric      : {'available' if HAS_F1MAX else 'not in this anomalib version — skipped'}")
 gpu_info = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU only"
 print(f"  Device            : {gpu_info}")
 print("=" * 60)
@@ -185,10 +165,10 @@ oom_skips: list[dict] = []
 class FastViTPatchcoreModel(PatchcoreModel):
     """PatchcoreModel forced to use FastViT-SA12 as feature extractor."""
     def __init__(self, **kw):
-        kw.setdefault("backbone", BACKBONE)
-        kw.setdefault("layers", LAYERS)
+        kw.setdefault("backbone", "fastvit_sa12")
+        kw.setdefault("layers", ["stages.2", "stages.3"])
         kw.setdefault("pre_trained", True)
-        kw.setdefault("num_neighbors", NUM_NEIGHBORS)
+        kw.setdefault("num_neighbors", 9)
         super().__init__(**kw)
 
 
@@ -196,16 +176,14 @@ class FastViTPatchcore(Patchcore):
     """Patchcore Lightning module wired to FastViTPatchcoreModel."""
     def __init__(self, **kw):
         super().__init__(
-            backbone=BACKBONE,
-            layers=LAYERS,
+            backbone="fastvit_sa12",
+            layers=["stages.2", "stages.3"],
             pre_trained=True,
-            coreset_sampling_ratio=CORESET_RATIO,
-            num_neighbors=NUM_NEIGHBORS,
+            coreset_sampling_ratio=0.25,
+            num_neighbors=9,
             **kw,
         )
-        self.model = FastViTPatchcoreModel(
-            num_neighbors=NUM_NEIGHBORS,
-        )
+        self.model = FastViTPatchcoreModel(num_neighbors=9)
 
 
 # ── Experiment loop (run-outer) ───────────────────────────────
@@ -246,18 +224,16 @@ for run in range(N_RUNS):
                 image_auroc = AUROC(fields=["pred_score", "gt_label"], prefix="image_")
                 pixel_auroc = AUROC(fields=["anomaly_map", "gt_mask"],  prefix="pixel_")
                 pixel_pro   = AUPRO(fields=["anomaly_map", "gt_mask"],  prefix="pixel_")
-                test_metrics = [image_auroc, pixel_auroc, pixel_pro]
-                if HAS_F1MAX:
-                    image_f1max = F1Max(fields=["pred_score", "gt_label"], prefix="image_")
-                    pixel_f1max = F1Max(fields=["anomaly_map", "gt_mask"],  prefix="pixel_")
-                    test_metrics += [image_f1max, pixel_f1max]
-                evaluator = Evaluator(test_metrics=test_metrics)
+                image_f1max = F1Max(fields=["pred_score", "gt_label"], prefix="image_")
+                pixel_f1max = F1Max(fields=["anomaly_map", "gt_mask"],  prefix="pixel_")
+                evaluator = Evaluator(test_metrics=[image_auroc, pixel_auroc, pixel_pro,
+                                                    image_f1max, pixel_f1max])
 
-                print(f"  → Building model ({BACKBONE} backbone)...")
+                print(f"  → Building model (fastvit_sa12 backbone)...")
                 model = FastViTPatchcore(
                     pre_processor=Patchcore.configure_pre_processor(
-                        image_size=IMAGE_SIZE,
-                        center_crop_size=CENTER_CROP,
+                        image_size=(256, 256),
+                        center_crop_size=(224, 224),
                     ),
                     evaluator=evaluator,
                     visualizer=False,
@@ -271,24 +247,21 @@ for run in range(N_RUNS):
                 engine.fit(model=model, datamodule=datamodule)
                 print(f"  → Coreset built.")
 
+                # ── FLOPs: backbone forward pass on one image (PyTorch native) ─────────
                 flops_M = None
-                if HAS_THOP:
-                    try:
-                        device = next(model.parameters()).device
-                        _dummy = torch.randn(1, 3, CENTER_CROP[0], CENTER_CROP[1], device=device)
-                        with warnings.catch_warnings():
-                            warnings.simplefilter("ignore")
-                            _flops, _ = _thop_profile(
-                                model.model.feature_extractor, inputs=(_dummy,), verbose=False
-                            )
-                        flops_M = round(_flops / 1e6, 1)
-                        print(f"  → Backbone FLOPs: {flops_M:.1f} M")
-                        del _dummy
-                    except Exception:
-                        pass
+                try:
+                    device = next(model.parameters()).device
+                    _dummy = torch.randn(1, 3, 224, 224, device=device)
+                    with FlopCounterMode(display=False) as fcm:
+                        _ = model.model.feature_extractor(_dummy)
+                    flops_M = round(fcm.get_total_flops() / 1e6, 1)
+                    print(f"  → Backbone FLOPs: {flops_M:.1f} M")
+                    del _dummy
+                except Exception:
+                    pass
 
                 extractor = model.model.feature_extractor
-                input_shape = (1, 3, CENTER_CROP[0], CENTER_CROP[1])
+                input_shape = (1, 3, 224, 224)
 
                 try:
                     gpu_tput = _gpu_throughput(extractor, input_shape=input_shape, batch=8)
@@ -451,7 +424,7 @@ pieces.append(_align(overall_df, display_cols))
 summary = pd.concat(pieces)
 
 print(f"\n{'=' * 140}")
-print(f"  FastViT-PatchCore  (N={N_RUNS}, Backbone: {BACKBONE}, Layers: {LAYERS}, Coreset: {int(CORESET_RATIO*100)}%)")
+print(f"  FastViT-PatchCore  (N={N_RUNS}, Backbone: fastvit_sa12, Layers: [stages.2, stages.3], Coreset: 25%)")
 print(f"  Raw CSV: {csv_path}")
 print(f"{'=' * 140}")
 print(summary.to_string(float_format=lambda x: f"{x:.1f}" if pd.notna(x) else "—"))

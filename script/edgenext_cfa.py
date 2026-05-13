@@ -37,34 +37,14 @@ from anomalib.models.image.cfa.torch_model import (
 )
 from anomalib.models.image.cfa.anomaly_map import AnomalyMapGenerator
 from anomalib.models.components.feature_extractors import TimmFeatureExtractor
+from anomalib.metrics import F1Max
 from lightning.pytorch.callbacks import TQDMProgressBar
+from torch.utils.flop_counter import FlopCounterMode
 import timm
-
-try:
-    from anomalib.metrics import F1Max
-    HAS_F1MAX = True
-except ImportError:
-    HAS_F1MAX = False
-
-try:
-    from thop import profile as _thop_profile
-    HAS_THOP = True
-except ImportError:
-    HAS_THOP = False
-
 import pandas as pd
 
 # ── Config ────────────────────────────────────────────────────
-N_RUNS: int        = int(sys.argv[1]) if len(sys.argv) > 1 else 1
-BACKBONE           = "edgenext_small"
-LAYERS             = ["stages.1", "stages.2", "stages.3"]
-GAMMA_C            = 1
-GAMMA_D            = 1
-NUM_NN             = 3
-NUM_HARD_NEG       = 3
-RADIUS             = 1e-5
-IMAGE_SIZE         = (256, 256)
-CENTER_CROP        = None
+N_RUNS: int = int(sys.argv[1]) if len(sys.argv) > 1 else 1
 torch.set_float32_matmul_precision("high")
 
 
@@ -193,13 +173,13 @@ class EdgeNeXtCfaModel(CfaModel):
     """
     def __init__(
         self,
-        backbone: str = BACKBONE,
-        layers: list[str] = LAYERS,
-        gamma_c: int = GAMMA_C,
-        gamma_d: int = GAMMA_D,
-        num_nearest_neighbors: int = NUM_NN,
-        num_hard_negative_features: int = NUM_HARD_NEG,
-        radius: float = RADIUS,
+        backbone: str = "edgenext_small",
+        layers: list[str] = ("stages.1", "stages.2", "stages.3"),
+        gamma_c: int = 1,
+        gamma_d: int = 1,
+        num_nearest_neighbors: int = 3,
+        num_hard_negative_features: int = 3,
+        radius: float = 1e-5,
     ) -> None:
         nn.Module.__init__(self)
 
@@ -254,34 +234,26 @@ class EdgeNeXtCfaModel(CfaModel):
 # ── EdgeNeXt-CFA Lightning module ─────────────────────────────
 class EdgeNeXtCfa(Cfa):
     """Cfa Lightning module wrapping EdgeNeXtCfaModel."""
-    def __init__(
-        self,
-        gamma_c: int = GAMMA_C,
-        gamma_d: int = GAMMA_D,
-        num_nearest_neighbors: int = NUM_NN,
-        num_hard_negative_features: int = NUM_HARD_NEG,
-        radius: float = RADIUS,
-        **kw,
-    ) -> None:
+    def __init__(self, **kw) -> None:
         # Pass a placeholder backbone so parent __init__ succeeds; we replace
         # `self.model` immediately afterward.
         super().__init__(
             backbone="resnet18",
-            gamma_c=gamma_c,
-            gamma_d=gamma_d,
-            num_nearest_neighbors=num_nearest_neighbors,
-            num_hard_negative_features=num_hard_negative_features,
-            radius=radius,
+            gamma_c=1,
+            gamma_d=1,
+            num_nearest_neighbors=3,
+            num_hard_negative_features=3,
+            radius=1e-5,
             **kw,
         )
         self.model = EdgeNeXtCfaModel(
-            backbone=BACKBONE,
-            layers=LAYERS,
-            gamma_c=gamma_c,
-            gamma_d=gamma_d,
-            num_nearest_neighbors=num_nearest_neighbors,
-            num_hard_negative_features=num_hard_negative_features,
-            radius=radius,
+            backbone="edgenext_small",
+            layers=["stages.1", "stages.2", "stages.3"],
+            gamma_c=1,
+            gamma_d=1,
+            num_nearest_neighbors=3,
+            num_hard_negative_features=3,
+            radius=1e-5,
         )
 
 
@@ -308,12 +280,10 @@ PROGRESS_FILE = "results/edgenext_cfa_progress.json"
 
 # ── Startup banner ────────────────────────────────────────────
 print("=" * 60)
-print(f"  EdgeNeXt-CFA  |  {BACKBONE}  |  Layers {LAYERS}")
-print(f"  γ_c={GAMMA_C}  γ_d={GAMMA_D}  K={NUM_NN}  J={NUM_HARD_NEG}  r={RADIUS}")
+print("  EdgeNeXt-CFA  |  edgenext_small  |  Layers [stages.1, stages.2, stages.3]")
+print("  γ_c=1  γ_d=1  K=3  J=3  r=1e-5")
 print(f"  Runs per category : {N_RUNS}")
 print(f"  Categories total  : {total_categories}  ({len(MVTEC_CATEGORIES)} MVTec + {len(VISA_CATEGORIES)} VisA)")
-print(f"  FLOPs (thop)      : {'available' if HAS_THOP else 'not installed — skipped'}")
-print(f"  F1Max metric      : {'available' if HAS_F1MAX else 'not in this anomalib version — skipped'}")
 gpu_info = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU only"
 print(f"  Device            : {gpu_info}")
 print("=" * 60)
@@ -368,18 +338,16 @@ for run in range(N_RUNS):
                 image_auroc = AUROC(fields=["pred_score", "gt_label"], prefix="image_")
                 pixel_auroc = AUROC(fields=["anomaly_map", "gt_mask"],  prefix="pixel_")
                 pixel_pro   = AUPRO(fields=["anomaly_map", "gt_mask"],  prefix="pixel_")
-                test_metrics = [image_auroc, pixel_auroc, pixel_pro]
-                if HAS_F1MAX:
-                    image_f1max = F1Max(fields=["pred_score", "gt_label"], prefix="image_")
-                    pixel_f1max = F1Max(fields=["anomaly_map", "gt_mask"],  prefix="pixel_")
-                    test_metrics += [image_f1max, pixel_f1max]
-                evaluator = Evaluator(test_metrics=test_metrics)
+                image_f1max = F1Max(fields=["pred_score", "gt_label"], prefix="image_")
+                pixel_f1max = F1Max(fields=["anomaly_map", "gt_mask"],  prefix="pixel_")
+                evaluator = Evaluator(test_metrics=[image_auroc, pixel_auroc, pixel_pro,
+                                                    image_f1max, pixel_f1max])
 
-                print(f"  → Building model ({BACKBONE} backbone)...")
+                print(f"  → Building model (edgenext_small backbone)...")
                 model = EdgeNeXtCfa(
                     pre_processor=Cfa.configure_pre_processor(
-                        image_size=IMAGE_SIZE,
-                        center_crop_size=CENTER_CROP,
+                        image_size=(256, 256),
+                        center_crop_size=None,
                     ),
                     evaluator=evaluator,
                     visualizer=False,
@@ -392,26 +360,22 @@ for run in range(N_RUNS):
                 engine = Engine(max_epochs=30, devices="auto", strategy="auto", logger=False, callbacks=[CompactBar()])
                 engine.fit(model=model, datamodule=datamodule)
 
-                # ── FLOPs: backbone forward pass on one image ─────────────
+                # ── FLOPs: backbone forward pass on one image (PyTorch native) ─────────────
                 flops_M = None
-                if HAS_THOP:
-                    try:
-                        device = next(model.parameters()).device
-                        _dummy = torch.randn(1, 3, IMAGE_SIZE[0], IMAGE_SIZE[1], device=device)
-                        with warnings.catch_warnings():
-                            warnings.simplefilter("ignore")
-                            _flops, _ = _thop_profile(
-                                model.model.feature_extractor, inputs=(_dummy,), verbose=False
-                            )
-                        flops_M = round(_flops / 1e6, 1)
-                        print(f"  → Backbone FLOPs: {flops_M:.1f} M")
-                        del _dummy
-                    except Exception:
-                        pass
+                try:
+                    device = next(model.parameters()).device
+                    _dummy = torch.randn(1, 3, 256, 256, device=device)
+                    with FlopCounterMode(display=False) as fcm:
+                        _ = model.model.feature_extractor(_dummy)
+                    flops_M = round(fcm.get_total_flops() / 1e6, 1)
+                    print(f"  → Backbone FLOPs: {flops_M:.1f} M")
+                    del _dummy
+                except Exception:
+                    pass
 
                 # ── Throughput, CPU latency, single-forward peak mem ─────────
                 extractor = model.model.feature_extractor
-                input_shape = (1, 3, IMAGE_SIZE[0], IMAGE_SIZE[1])
+                input_shape = (1, 3, 256, 256)
 
                 try:
                     gpu_tput = _gpu_throughput(extractor, input_shape=input_shape, batch=8)
@@ -566,7 +530,7 @@ pieces.append(_align(overall_df, display_cols))
 summary = pd.concat(pieces)
 
 print(f"\n{'=' * 140}")
-print(f"  EdgeNeXt-CFA  (N={N_RUNS}, Backbone: {BACKBONE}, Layers: {LAYERS}, γ_c={GAMMA_C}, γ_d={GAMMA_D}, K={NUM_NN})")
+print(f"  EdgeNeXt-CFA  (N={N_RUNS}, Backbone: edgenext_small, Layers: [stages.1, stages.2, stages.3], γ_c=1, γ_d=1, K=3)")
 print(f"  Raw CSV: {csv_path}")
 print(f"{'=' * 140}")
 print(summary.to_string(float_format=lambda x: f"{x:.1f}" if pd.notna(x) else "—"))

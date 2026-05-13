@@ -35,41 +35,19 @@ for _log in ("lightning", "lightning.pytorch", "anomalib", "torchvision", "torch
     logging.getLogger(_log).setLevel(logging.ERROR)
 print("Importing torch-related libraries...")
 import torch
+import torch.nn as nn
 from anomalib.data import MVTecAD, Visa
 from anomalib.engine import Engine
-from anomalib.metrics import AUPRO, AUROC, Evaluator
+from anomalib.metrics import AUPRO, AUROC, F1Max, Evaluator
 from anomalib.models import EfficientAd
 from lightning.pytorch.callbacks import TQDMProgressBar
+from torch.utils.flop_counter import FlopCounterMode
+import pandas as pd
 
 torch.set_float32_matmul_precision('high')
 
-# F1Max: anomalib ≥ 1.x; graceful fallback if missing
-try:
-    from anomalib.metrics import F1Max
-    HAS_F1MAX = True
-except ImportError:
-    HAS_F1MAX = False
-
-# FLOPs counting (pip install thop)
-try:
-    from thop import profile as _thop_profile
-    HAS_THOP = True
-except ImportError:
-    HAS_THOP = False
-
-import pandas as pd
-
 # ── Config ────────────────────────────────────────────────────
-N_RUNS: int        = int(sys.argv[1]) if len(sys.argv) > 1 else 1
-
-# ============================================================
-#  SELECT VARIANT HERE
-# ============================================================
-# (§4): "EfficientAD-S uses the architecture displayed in Figure 2"
-# (§4): "For EfficientAD-M, we double the number of kernels in the
-#         hidden convolutional layers [...] and insert a 1×1 convolution"
-VARIANT = "s"  # <-- change to "m" for EfficientAD-M
-# ============================================================
+N_RUNS: int = int(sys.argv[1]) if len(sys.argv) > 1 else 1
 
 # ── GPU helpers ───────────────────────────────────────────────
 def free_gpu() -> None:
@@ -167,15 +145,13 @@ DATASETS = [
 total_categories = sum(len(c) for _, _, c, _ in DATASETS)
 
 os.makedirs("results", exist_ok=True)
-PROGRESS_FILE = f"results/efficientad_{VARIANT}_progress.json"
+PROGRESS_FILE = "results/efficientad_s_progress.json"
 
 # ── Startup banner ────────────────────────────────────────────
 print("=" * 60)
-print(f"  EfficientAD-{VARIANT.upper()}  |  PDN teacher_out=384  |  max_steps=70000")
+print("  EfficientAD-S  |  PDN teacher_out=384  |  max_steps=70000")
 print(f"  Runs per category : {N_RUNS}")
 print(f"  Categories total  : {total_categories}  ({len(MVTEC_CATEGORIES)} MVTec + {len(VISA_CATEGORIES)} VisA)")
-print(f"  FLOPs (thop)      : {'available' if HAS_THOP else 'not installed — skipped'}")
-print(f"  F1Max metric      : {'available' if HAS_F1MAX else 'not in this anomalib version — skipped'}")
 gpu_info = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU only"
 print(f"  Device            : {gpu_info}")
 print("=" * 60)
@@ -232,13 +208,10 @@ for run in range(N_RUNS):
                 image_auroc = AUROC(fields=["pred_score", "gt_label"], prefix="image_")
                 # Pixel-level AU-PRO (Table 1) — fpr_limit=0.3, matching §4
                 pixel_pro = AUPRO(fields=["anomaly_map", "gt_mask"], prefix="pixel_")
-                test_metrics = [image_auroc, pixel_pro]
-                if HAS_F1MAX:
-                    image_f1max = F1Max(fields=["pred_score", "gt_label"], prefix="image_")
-                    test_metrics.append(image_f1max)
-                evaluator = Evaluator(test_metrics=test_metrics)
+                image_f1max = F1Max(fields=["pred_score", "gt_label"], prefix="image_")
+                evaluator = Evaluator(test_metrics=[image_auroc, pixel_pro, image_f1max])
 
-                print(f"  → Building model (EfficientAD-{VARIANT.upper()})...")
+                print(f"  → Building model (EfficientAD-S)...")
                 model = EfficientAd(
                     # (§3.2): "we sample a random image P from the pretraining dataset"
                     # imagenet_dir="./datasets/imagenette",
@@ -268,22 +241,18 @@ for run in range(N_RUNS):
                 engine.fit(model=model, datamodule=datamodule)
                 print(f"  → Training complete.")
 
-                # ── FLOPs: PDN student forward on one image ───────────
+                # ── FLOPs: PDN student forward on one image (PyTorch native) ───────────
                 flops_M = None
-                if HAS_THOP:
-                    try:
-                        device = next(model.parameters()).device
-                        _dummy = torch.randn(1, 3, 256, 256, device=device)
-                        with warnings.catch_warnings():
-                            warnings.simplefilter("ignore")
-                            _flops, _ = _thop_profile(
-                                model.model.student, inputs=(_dummy,), verbose=False
-                            )
-                        flops_M = round(_flops / 1e6, 1)
-                        print(f"  → Student FLOPs: {flops_M:.1f} M")
-                        del _dummy
-                    except Exception:
-                        pass
+                try:
+                    device = next(model.parameters()).device
+                    _dummy = torch.randn(1, 3, 256, 256, device=device)
+                    with FlopCounterMode(display=False) as fcm:
+                        _ = model.model.student(_dummy)
+                    flops_M = round(fcm.get_total_flops() / 1e6, 1)
+                    print(f"  → Student FLOPs: {flops_M:.1f} M")
+                    del _dummy
+                except Exception:
+                    pass
 
                 extractor = model.model.student
                 input_shape = (1, 3, 256, 256)
@@ -394,7 +363,7 @@ if not rows:
     sys.exit(0)
 
 df = pd.DataFrame(rows)
-csv_path = f"results/efficientad_{VARIANT}_results.csv"
+csv_path = "results/efficientad_s_results.csv"
 df.to_csv(csv_path, index=False)
 
 metric_cols = ["img_auroc", "pxl_auroc", "aupro", "img_f1max", "pxl_f1max",
@@ -438,7 +407,7 @@ pieces.append(_align(overall_df, display_cols))
 summary = pd.concat(pieces)
 
 print(f"\n{'=' * 140}")
-print(f"  EfficientAD-{VARIANT.upper()}  (N={N_RUNS}, PDN teacher_out=384, max_steps=70000)")
+print(f"  EfficientAD-S  (N={N_RUNS}, PDN teacher_out=384, max_steps=70000)")
 print(f"  Raw CSV: {csv_path}")
 print(f"{'=' * 140}")
 print(summary.to_string(float_format=lambda x: f"{x:.1f}" if pd.notna(x) else "—"))

@@ -33,31 +33,18 @@ for _log in ("lightning", "lightning.pytorch", "anomalib", "torchvision", "torch
     logging.getLogger(_log).setLevel(logging.ERROR)
 print("Importing torch-related libraries...")
 import torch
+import torch.nn as nn
 from anomalib.data import MVTecAD, Visa
 from anomalib.engine import Engine
-from anomalib.metrics import AUPRO, AUROC, Evaluator
+from anomalib.metrics import AUPRO, AUROC, F1Max, Evaluator
 from anomalib.models.image import AnomalyDINO
 from lightning.pytorch.callbacks import TQDMProgressBar
+import pandas as pd
 
 torch.set_float32_matmul_precision('high')
 
-# F1Max: anomalib >= 1.x; graceful fallback if missing
-try:
-    from anomalib.metrics import F1Max
-    HAS_F1MAX = True
-except ImportError:
-    HAS_F1MAX = False
-
-import pandas as pd
-
 # - Config -------------------------------------------------------------------
-N_RUNS: int        = int(sys.argv[1]) if len(sys.argv) > 1 else 1
-
-ENCODER         = "dinov2_vit_small_14"
-NUM_NEIGHBOURS  = 1
-CORESET_SAMPLING = True
-SAMPLING_RATIO  = 0.25
-MASKING         = True    # PCA-based foreground/background masking
+N_RUNS: int = int(sys.argv[1]) if len(sys.argv) > 1 else 1
 
 # - GPU helpers --------------------------------------------------------------
 def free_gpu() -> None:
@@ -159,11 +146,10 @@ PROGRESS_FILE = "results/anomalydino_progress.json"
 
 # - Startup banner -----------------------------------------------------------
 print("=" * 60)
-print(f"  AnomalyDINO  |  Encoder: {ENCODER}")
-print(f"  neighbours={NUM_NEIGHBOURS}  |  coreset={CORESET_SAMPLING}  |  ratio={SAMPLING_RATIO}  |  masking={MASKING}")
+print("  AnomalyDINO  |  Encoder: dinov2_vit_small_14")
+print("  neighbours=1  |  coreset=True  |  ratio=0.25  |  masking=True")
 print(f"  Runs per category : {N_RUNS}")
 print(f"  Categories total  : {total_categories}  ({len(MVTEC_CATEGORIES)} MVTec + {len(VISA_CATEGORIES)} VisA)")
-print(f"  F1Max metric      : {'available' if HAS_F1MAX else 'not in this anomalib version -- skipped'}")
 gpu_info = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU only"
 print(f"  Device            : {gpu_info}")
 print("=" * 60)
@@ -217,20 +203,18 @@ for run in range(N_RUNS):
                 image_auroc = AUROC(fields=["pred_score", "gt_label"], prefix="image_")
                 pixel_auroc = AUROC(fields=["anomaly_map", "gt_mask"],  prefix="pixel_")
                 pixel_pro   = AUPRO(fields=["anomaly_map", "gt_mask"],  prefix="pixel_")
-                test_metrics = [image_auroc, pixel_auroc, pixel_pro]
-                if HAS_F1MAX:
-                    image_f1max = F1Max(fields=["pred_score", "gt_label"], prefix="image_")
-                    pixel_f1max = F1Max(fields=["anomaly_map", "gt_mask"],  prefix="pixel_")
-                    test_metrics += [image_f1max, pixel_f1max]
-                evaluator = Evaluator(test_metrics=test_metrics)
+                image_f1max = F1Max(fields=["pred_score", "gt_label"], prefix="image_")
+                pixel_f1max = F1Max(fields=["anomaly_map", "gt_mask"],  prefix="pixel_")
+                evaluator = Evaluator(test_metrics=[image_auroc, pixel_auroc, pixel_pro,
+                                                    image_f1max, pixel_f1max])
 
-                print(f"  -> Building model ({ENCODER})...")
+                print(f"  -> Building model (dinov2_vit_small_14)...")
                 model = AnomalyDINO(
-                    encoder_name=ENCODER,
-                    num_neighbours=NUM_NEIGHBOURS,
-                    masking=MASKING,
-                    coreset_subsampling=CORESET_SAMPLING,
-                    sampling_ratio=SAMPLING_RATIO,
+                    encoder_name="dinov2_vit_small_14",
+                    num_neighbours=1,
+                    masking=True,
+                    coreset_subsampling=True,
+                    sampling_ratio=0.25,
                     evaluator=evaluator,
                     visualizer=False,
                 )
@@ -399,7 +383,7 @@ pieces.append(_align(overall_df, display_cols))
 summary = pd.concat(pieces)
 
 print(f"\n{'=' * 140}")
-print(f"  AnomalyDINO  (N={N_RUNS}, Encoder: {ENCODER}, Neighbours: {NUM_NEIGHBOURS}, Coreset: {SAMPLING_RATIO}, Masking: {MASKING})")
+print(f"  AnomalyDINO  (N={N_RUNS}, Encoder: dinov2_vit_small_14, Neighbours: 1, Coreset: 0.25, Masking: True)")
 print(f"  Raw CSV: {csv_path}")
 print(f"{'=' * 140}")
 print(summary.to_string(float_format=lambda x: f"{x:.1f}" if pd.notna(x) else "—"))

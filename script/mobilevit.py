@@ -32,51 +32,20 @@ os.environ["PYTHONWARNINGS"] = "ignore"
 for _log in ("lightning", "lightning.pytorch", "anomalib", "torchvision", "torch"):
     logging.getLogger(_log).setLevel(logging.ERROR)
 print("Importing torch-related libraries...")
-import timm
 import torch
+import torch.nn as nn
 from anomalib.data import MVTecAD, Visa
 from anomalib.engine import Engine
-from anomalib.metrics import AUPRO, AUROC, Evaluator
+from anomalib.metrics import AUPRO, AUROC, F1Max, Evaluator
 from anomalib.models import Patchcore
 from lightning.pytorch.callbacks import TQDMProgressBar
+from torch.utils.flop_counter import FlopCounterMode
+import pandas as pd
 
 torch.set_float32_matmul_precision('high')
 
-# F1Max: anomalib ≥ 1.x; graceful fallback if missing
-try:
-    from anomalib.metrics import F1Max
-    HAS_F1MAX = True
-except ImportError:
-    HAS_F1MAX = False
-
-# FLOPs counting (pip install thop)
-try:
-    from thop import profile as _thop_profile
-    HAS_THOP = True
-except ImportError:
-    HAS_THOP = False
-
-import pandas as pd
-
 # ── Config ────────────────────────────────────────────────────
-N_RUNS: int        = int(sys.argv[1]) if len(sys.argv) > 1 else 1
-
-# ============================================================
-#  BACKBONE CONFIGURATION
-# ============================================================
-# MobileViT-S from timm (ICLR 2022, §4.1: "5.6M params, 78.4% top-1")
-BACKBONE = "mobilevit_s"
-
-# --- Discover available feature extraction layers ---
-_tmp = timm.create_model(BACKBONE, features_only=True, pretrained=True)
-available_layers = _tmp.feature_info.module_name()
-print(f"Available layers for {BACKBONE}: {available_layers}")
-# Typical output: ['stages.0.0', 'stages.1.0', 'stages.2.0', 'stages.3.0', 'stages.4.0']
-# We pick the two mid-level stages (analogous to layer2 + layer3 in ResNet)
-LAYERS = [available_layers[2], available_layers[3]]
-print(f"Using layers: {LAYERS}")
-del _tmp
-# ============================================================
+N_RUNS: int = int(sys.argv[1]) if len(sys.argv) > 1 else 1
 
 # ── GPU helpers ───────────────────────────────────────────────
 def free_gpu() -> None:
@@ -180,11 +149,9 @@ PROGRESS_FILE = "results/mobilevit_progress.json"
 
 # ── Startup banner ────────────────────────────────────────────
 print("=" * 60)
-print(f"  PatchCore + {BACKBONE}  |  Layers: {LAYERS}  |  Coreset: 25%")
+print("  PatchCore + MobileViT-S  |  Layers: stages.2.0+stages.3.0  |  Coreset: 25%")
 print(f"  Runs per category : {N_RUNS}")
 print(f"  Categories total  : {total_categories}  ({len(MVTEC_CATEGORIES)} MVTec + {len(VISA_CATEGORIES)} VisA)")
-print(f"  FLOPs (thop)      : {'available' if HAS_THOP else 'not installed — skipped'}")
-print(f"  F1Max metric      : {'available' if HAS_F1MAX else 'not in this anomalib version — skipped'}")
 gpu_info = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU only"
 print(f"  Device            : {gpu_info}")
 print("=" * 60)
@@ -240,18 +207,16 @@ for run in range(N_RUNS):
                 image_auroc = AUROC(fields=["pred_score", "gt_label"], prefix="image_")
                 pixel_auroc = AUROC(fields=["anomaly_map", "gt_mask"],  prefix="pixel_")
                 pixel_pro   = AUPRO(fields=["anomaly_map", "gt_mask"],  prefix="pixel_")
-                test_metrics = [image_auroc, pixel_auroc, pixel_pro]
-                if HAS_F1MAX:
-                    image_f1max = F1Max(fields=["pred_score", "gt_label"], prefix="image_")
-                    pixel_f1max = F1Max(fields=["anomaly_map", "gt_mask"],  prefix="pixel_")
-                    test_metrics += [image_f1max, pixel_f1max]
-                evaluator = Evaluator(test_metrics=test_metrics)
+                image_f1max = F1Max(fields=["pred_score", "gt_label"], prefix="image_")
+                pixel_f1max = F1Max(fields=["anomaly_map", "gt_mask"],  prefix="pixel_")
+                evaluator = Evaluator(test_metrics=[image_auroc, pixel_auroc, pixel_pro,
+                                                    image_f1max, pixel_f1max])
 
-                print(f"  → Building model ({BACKBONE} backbone)...")
+                print(f"  → Building model (MobileViT-S backbone)...")
                 model = Patchcore(
                     # MobileViT-S (ICLR 2022): lightweight ViT backbone
-                    backbone=BACKBONE,
-                    layers=LAYERS,
+                    backbone="mobilevit_s",
+                    layers=["stages.2.0", "stages.3.0"],
                     pre_trained=True,
                     # PatchCore paper (§3.2): 25% coreset subsampling
                     coreset_sampling_ratio=0.25,
@@ -274,22 +239,18 @@ for run in range(N_RUNS):
                 engine.fit(model=model, datamodule=datamodule)
                 print(f"  → Coreset built.")
 
-                # ── FLOPs: backbone forward pass on one image ─────────
+                # ── FLOPs: backbone forward pass on one image (PyTorch native) ─────────
                 flops_M = None
-                if HAS_THOP:
-                    try:
-                        device = next(model.parameters()).device
-                        _dummy = torch.randn(1, 3, 224, 224, device=device)
-                        with warnings.catch_warnings():
-                            warnings.simplefilter("ignore")
-                            _flops, _ = _thop_profile(
-                                model.model.feature_extractor, inputs=(_dummy,), verbose=False
-                            )
-                        flops_M = round(_flops / 1e6, 1)
-                        print(f"  → Backbone FLOPs: {flops_M:.1f} M")
-                        del _dummy
-                    except Exception:
-                        pass
+                try:
+                    device = next(model.parameters()).device
+                    _dummy = torch.randn(1, 3, 224, 224, device=device)
+                    with FlopCounterMode(display=False) as fcm:
+                        _ = model.model.feature_extractor(_dummy)
+                    flops_M = round(fcm.get_total_flops() / 1e6, 1)
+                    print(f"  → Backbone FLOPs: {flops_M:.1f} M")
+                    del _dummy
+                except Exception:
+                    pass
 
                 extractor = model.model.feature_extractor
                 input_shape = (1, 3, 224, 224)
@@ -456,7 +417,7 @@ pieces.append(_align(overall_df, display_cols))
 summary = pd.concat(pieces)
 
 print(f"\n{'=' * 140}")
-print(f"  PatchCore + MobileViT-S  (N={N_RUNS}, Backbone: {BACKBONE}, Layers: {LAYERS}, Coreset: 25%)")
+print(f"  PatchCore + MobileViT-S  (N={N_RUNS}, Backbone: mobilevit_s, Layers: stages.2.0+stages.3.0, Coreset: 25%)")
 print(f"  Raw CSV: {csv_path}")
 print(f"{'=' * 140}")
 print(summary.to_string(float_format=lambda x: f"{x:.1f}" if pd.notna(x) else "—"))

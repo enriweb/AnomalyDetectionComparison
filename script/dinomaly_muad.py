@@ -46,15 +46,10 @@ from lightning.pytorch.callbacks import TQDMProgressBar
 
 torch.set_float32_matmul_precision('high')
 
-try:
-    from anomalib.metrics import F1Max
-    HAS_F1MAX = True
-except ImportError:
-    HAS_F1MAX = False
+from anomalib.metrics import F1Max
 
 # ── Config ────────────────────────────────────────────────────
 N_RUNS: int = int(sys.argv[1]) if len(sys.argv) > 1 else 1
-ENCODER     = "dinov2reg_vit_base_14"
 ROOT        = "./datasets/MVTecAD"
 MVTEC_CATEGORIES = [
     "bottle", "cable", "capsule", "carpet", "grid",
@@ -109,18 +104,15 @@ def make_evaluator():
         AUROC(fields=["pred_score", "gt_label"], prefix="image_"),
         AUROC(fields=["anomaly_map", "gt_mask"], prefix="pixel_"),
         AUPRO(fields=["anomaly_map", "gt_mask"], prefix="pixel_"),
+        F1Max(fields=["pred_score", "gt_label"], prefix="image_"),
+        F1Max(fields=["anomaly_map", "gt_mask"], prefix="pixel_"),
     ]
-    if HAS_F1MAX:
-        metrics += [
-            F1Max(fields=["pred_score", "gt_label"], prefix="image_"),
-            F1Max(fields=["anomaly_map", "gt_mask"], prefix="pixel_"),
-        ]
     return Evaluator(test_metrics=metrics)
 
 
 def build_model(evaluator):
     return Dinomaly(
-        encoder_name=ENCODER,
+        encoder_name="dinov2reg_vit_base_14",
         bottleneck_dropout=0.2,
         decoder_depth=8,
         target_layers=None,
@@ -139,7 +131,7 @@ def build_model(evaluator):
 
 # ── Banner ────────────────────────────────────────────────────
 print("=" * 60)
-print(f"  Dinomaly — MUAD  |  Encoder: {ENCODER}")
+print("  Dinomaly — MUAD  |  Encoder: dinov2reg_vit_base_14")
 print(f"  batch=16  |  image=448  |  crop=392  |  max_steps=5000")
 print(f"  Categories: {len(MVTEC_CATEGORIES)} (MVTec)")
 print(f"  Runs: {N_RUNS}")
@@ -288,7 +280,7 @@ lines = []
 SEP = "=" * 80
 lines.append(SEP)
 lines.append(f"  Dinomaly MUAD Results  (N={N_RUNS} run{'s' if N_RUNS > 1 else ''})")
-lines.append(f"  Encoder: {ENCODER}  |  one model jointly on {len(MVTEC_CATEGORIES)} categories")
+lines.append(f"  Encoder: dinov2reg_vit_base_14  |  one model jointly on {len(MVTEC_CATEGORIES)} categories")
 lines.append(SEP)
 
 HDR = (f"{'Category':<15} {'Img AUROC':>{C}} {'Pxl AUROC':>{C}} {'AUPRO':>{C}}"

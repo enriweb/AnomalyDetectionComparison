@@ -50,25 +50,6 @@ torch.set_float32_matmul_precision("high")
 # ── Config ────────────────────────────────────────────────────
 N_RUNS: int = int(sys.argv[1]) if len(sys.argv) > 1 else 1
 
-# Dinomaly defaults with paper-aligned reasonable settings
-ENCODER = "dinov2reg_vit_base_14"
-BOTTLENECK_DROPOUT = 0.2
-DECODER_DEPTH = 8
-TRAIN_STEPS = 40000  # paper protocol (Guo+ 2025, Table I)
-IMAGE_SIZE = (448, 448)
-CROP_SIZE = 392
-TRAIN_BATCH_SIZE = 16
-EVAL_BATCH_SIZE = 16
-
-# Dinomaly2-specific settings from arXiv:2510.17611
-# Paper uses middle 8 encoder layers {3..10} in 1-based indexing.
-TARGET_LAYERS = [2, 3, 4, 5, 6, 7, 8, 9]  # 0-based for implementation
-# Loose group-to-group reconstruction with 2 groups (Eq. 13-14, Fig. 5e).
-FUSE_LAYER_ENCODER = [[0, 1, 2, 3], [4, 5, 6, 7]]
-FUSE_LAYER_DECODER = [[0, 1, 2, 3], [4, 5, 6, 7]]
-# Context-Aware Recentering (Sec. 3.4, Eq. 12).
-USE_CONTEXT_RECENTERING = True
-
 # ── GPU cleanup helper ────────────────────────────────────────
 def free_gpu() -> None:
     gc.collect()
@@ -172,9 +153,9 @@ PROGRESS_FILE = "results/dinomaly2_progress.json"
 
 # ── Startup banner ────────────────────────────────────────────
 print("=" * 60)
-print(f"  Dinomaly2  |  Encoder: {ENCODER}")
-print(f"  dropout={BOTTLENECK_DROPOUT}  |  decoder_depth={DECODER_DEPTH}  |  train_steps={TRAIN_STEPS}")
-print(f"  context_recentering={USE_CONTEXT_RECENTERING}  |  layer_groups={len(FUSE_LAYER_ENCODER)}")
+print("  Dinomaly2  |  Encoder: dinov2reg_vit_base_14")
+print("  dropout=0.2  |  decoder_depth=8  |  train_steps=40000")
+print("  context_recentering=True  |  layer_groups=2")
 print(f"  Runs per category : {N_RUNS}")
 print(f"  Categories total  : {total_categories}  ({len(MVTEC_CATEGORIES)} MVTec + {len(VISA_CATEGORIES)} VisA)")
 gpu_info = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU only"
@@ -224,8 +205,8 @@ for run in range(N_RUNS):
                 datamodule = DataModule(
                     root=root,
                     category=category,
-                    train_batch_size=TRAIN_BATCH_SIZE,
-                    eval_batch_size=EVAL_BATCH_SIZE,
+                    train_batch_size=16,
+                    eval_batch_size=16,
                 )
 
                 image_auroc = AUROC(fields=["pred_score", "gt_label"], prefix="image_")
@@ -236,18 +217,20 @@ for run in range(N_RUNS):
                 evaluator = Evaluator(test_metrics=[image_auroc, pixel_auroc, pixel_pro,
                                                     image_f1max, pixel_f1max])
 
-                print(f"  → Building model ({ENCODER})...")
+                print("  → Building model (dinov2reg_vit_base_14)...")
                 model = Dinomaly(
-                    encoder_name=ENCODER,
-                    bottleneck_dropout=BOTTLENECK_DROPOUT,
-                    decoder_depth=DECODER_DEPTH,
-                    target_layers=TARGET_LAYERS,
-                    fuse_layer_encoder=FUSE_LAYER_ENCODER,
-                    fuse_layer_decoder=FUSE_LAYER_DECODER,
+                    encoder_name="dinov2reg_vit_base_14",
+                    bottleneck_dropout=0.2,
+                    decoder_depth=8,
+                    # Paper uses middle 8 encoder layers {3..10} in 1-based indexing.
+                    target_layers=[2, 3, 4, 5, 6, 7, 8, 9],
+                    # Loose group-to-group reconstruction with 2 groups (Eq. 13-14, Fig. 5e).
+                    fuse_layer_encoder=[[0, 1, 2, 3], [4, 5, 6, 7]],
+                    fuse_layer_decoder=[[0, 1, 2, 3], [4, 5, 6, 7]],
                     remove_class_token=False,
                     pre_processor=Dinomaly.configure_pre_processor(
-                        image_size=IMAGE_SIZE,
-                        crop_size=CROP_SIZE,
+                        image_size=(448, 448),
+                        crop_size=392,
                     ),
                     evaluator=evaluator,
                     visualizer=False,
@@ -255,27 +238,26 @@ for run in range(N_RUNS):
 
                 # Context-Aware Recentering (Dinomaly2 paper, Sec 3.4, Eq.12):
                 # Subtract class token from patch tokens before reconstruction.
-                if USE_CONTEXT_RECENTERING:
-                    _orig_encoder_forward = model.model.encoder.forward
+                _orig_encoder_forward = model.model.encoder.forward
 
-                    def _recentered_forward(x):
-                        result = _orig_encoder_forward(x)
-                        if isinstance(result, dict):
-                            for k in list(result.keys()):
-                                v = result[k]
-                                if isinstance(v, torch.Tensor) and v.dim() == 3 and v.shape[1] > 1:
-                                    cls = v[:, 0:1, :]
-                                    result[k] = torch.cat([cls, v[:, 1:, :] - cls], dim=1)
-                        return result
+                def _recentered_forward(x):
+                    result = _orig_encoder_forward(x)
+                    if isinstance(result, dict):
+                        for k in list(result.keys()):
+                            v = result[k]
+                            if isinstance(v, torch.Tensor) and v.dim() == 3 and v.shape[1] > 1:
+                                cls = v[:, 0:1, :]
+                                result[k] = torch.cat([cls, v[:, 1:, :] - cls], dim=1)
+                    return result
 
-                    model.model.encoder.forward = _recentered_forward
-                    print("  → Context-aware recentering applied (encoder monkey-patch).")
+                model.model.encoder.forward = _recentered_forward
+                print("  → Context-aware recentering applied (encoder monkey-patch).")
 
                 n_params = sum(p.numel() for p in model.parameters())
                 print(f"  → Parameters: {n_params:,}")
 
-                print(f"  → Training (max_steps={TRAIN_STEPS})...")
-                engine = Engine(max_steps=TRAIN_STEPS, devices="auto", strategy="auto", logger=False, callbacks=[CompactBar()])
+                print("  → Training (max_steps=40000)...")
+                engine = Engine(max_steps=40000, devices="auto", strategy="auto", logger=False, callbacks=[CompactBar()])
                 engine.fit(model=model, datamodule=datamodule)
                 print("  → Training complete.")
 
@@ -449,7 +431,7 @@ pieces.append(_align(overall_df, display_cols))
 summary = pd.concat(pieces)
 
 print(f"\n{'=' * 140}")
-print(f"  Dinomaly2  (N={N_RUNS}, Encoder: {ENCODER}, dropout={BOTTLENECK_DROPOUT}, depth={DECODER_DEPTH}, Context Recentering: {USE_CONTEXT_RECENTERING})")
+print(f"  Dinomaly2  (N={N_RUNS}, Encoder: dinov2reg_vit_base_14, dropout=0.2, depth=8, Context Recentering: True)")
 print(f"  Raw CSV: {csv_path}")
 print(f"{'=' * 140}")
 print(summary.to_string(float_format=lambda x: f"{x:.1f}" if pd.notna(x) else "—"))
