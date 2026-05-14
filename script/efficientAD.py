@@ -21,7 +21,6 @@ NOTE: EfficientAD requires train_batch_size=1 (anomalib constraint).
 
 import copy
 import gc
-import json
 import logging
 import os
 import shutil
@@ -146,8 +145,8 @@ DATASETS = [
 total_categories = sum(len(c) for _, _, c, _ in DATASETS)
 
 os.makedirs("results", exist_ok=True)
-PROGRESS_FILE = "results/efficientad_s_progress.json"
 csv_path = "results/efficientad_s_results.csv"
+combined_txt = "results/efficientad_s_combined.txt"
 CKPT_DIR = "results/EfficientAd"
 
 # ── Startup banner ────────────────────────────────────────────
@@ -159,22 +158,27 @@ gpu_info = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU 
 print(f"  Device            : {gpu_info}")
 print("=" * 60)
 
-if os.path.exists(PROGRESS_FILE):
-    with open(PROGRESS_FILE) as f:
-        results = json.load(f)
-    print(f"\n[resume] Found checkpoint — resuming from {PROGRESS_FILE}")
+results = {ds: {} for ds, *_ in DATASETS}
+if os.path.exists(csv_path):
+    prior = pd.read_csv(csv_path)
+    for _, r in prior.iterrows():
+        ds, cat = r["dataset"], r["category"]
+        results.setdefault(ds, {}).setdefault(cat, []).append(r.to_dict())
+    print(f"\n[resume] Loaded {len(prior)} prior rows from {csv_path}")
 else:
-    results = {ds: {} for ds, *_ in DATASETS}
-    print("\n[start] No checkpoint found — starting fresh.")
+    print("\n[start] No CSV found — starting fresh.")
 
 # ── OOM skip tracking ─────────────────────────────────────────
 oom_skips: list[dict] = []
+cycle_secs: list[float] = []
+t_total_start = time.time()
 
 # ── Experiment loop (run-outer) ───────────────────────────────
 for run in range(N_RUNS):
     print(f"\n{'='*60}")
     print(f"  RUN {run+1}/{N_RUNS}")
     print(f"{'='*60}")
+    t_cycle_start = time.time()
 
     for ds_idx, (ds_name, DataModule, categories, root) in enumerate(DATASETS, 1):
         print(f"\n{'-'*60}")
@@ -196,6 +200,7 @@ for run in range(N_RUNS):
             model = engine = datamodule = evaluator = None
             image_auroc = pixel_pro = None
             image_f1max = test_results = metrics = None
+            t_run_start = time.time()
             try:
                 print(f"  → Loading datamodule...")
                 # (§3.1): image size 256×256
@@ -300,6 +305,7 @@ for run in range(N_RUNS):
                       + (f" | F1Max {img_f1:.1f}%" if img_f1 is not None else ""))
                 print(f"  → GPU inf: {elapsed_gpu:.3f}s  |  Peak GPU: {peak_gpu_mb:.1f} MB")
 
+                run_wall_s = time.time() - t_run_start
                 run_record = {
                     "image_AUROC":     img_auc,
                     "pixel_AUROC":     None,
@@ -313,11 +319,9 @@ for run in range(N_RUNS):
                     "gpu_throughput":  gpu_tput,
                     "cpu_latency_ms":  cpu_lat,
                     "peak_gpu_mem_b":  peak_mem_1fwd,
+                    "run_wall_s":      run_wall_s,
                 }
                 results[ds_name][category].append(run_record)
-
-                with open(PROGRESS_FILE, "w") as f:
-                    json.dump(results, f, indent=2)
 
                 csv_row = {"dataset": ds_name, "category": category, "run": run + 1, **run_record}
                 pd.DataFrame([csv_row]).to_csv(
@@ -325,15 +329,14 @@ for run in range(N_RUNS):
                     header=not os.path.exists(csv_path),
                     index=False,
                 )
-                print(f"  → Checkpoint saved.")
+                print(f"  → Row saved ({run_wall_s:.1f}s wall).")
 
             except Exception as e:
                 if "out of memory" in str(e).lower():
-                    oom_skips.append({"ds": ds_name, "category": category, "run": run + 1})
+                    oom_skips.append({"ds": ds_name, "category": category,
+                                       "run": run + 1, "wall_s": time.time() - t_run_start})
                     print(f"\n  [OOM] CUDA out of memory — {ds_name}/{category} run {run+1}. "
                           f"Skipping. (total OOM skips so far: {len(oom_skips)})")
-                    with open(PROGRESS_FILE, "w") as f:
-                        json.dump(results, f, indent=2)
                 else:
                     raise
             finally:
@@ -344,13 +347,14 @@ for run in range(N_RUNS):
                 shutil.rmtree(CKPT_DIR, ignore_errors=True)
                 shutil.rmtree("lightning_logs", ignore_errors=True)
 
-# ── Post-loop: clean up checkpoint ───────────────────────────
+    cycle_secs.append(time.time() - t_cycle_start)
+    print(f"\n  Cycle {run+1}/{N_RUNS} complete in {cycle_secs[-1]:.1f}s ({cycle_secs[-1]/60:.1f} min)")
+
+total_secs = time.time() - t_total_start
+
+# ── Post-loop ────────────────────────────────────────────────
 print(f"\n{'='*60}")
-print("  All runs complete.")
-if os.path.exists(PROGRESS_FILE):
-    os.remove(PROGRESS_FILE)
-    print(f"  Checkpoint deleted ({PROGRESS_FILE}).")
-    print("  Next invocation will start fresh.")
+print(f"  All runs complete in {total_secs:.1f}s ({total_secs/60:.1f} min)")
 print(f"{'='*60}\n")
 
 # ── Build pandas DataFrame & unified summary ──────────────────
@@ -368,6 +372,7 @@ for ds_name, _, categories, _ in DATASETS:
                 "inf_s": rec.get("inference_gpu_s"), "peak_gpu_mb": rec.get("peak_gpu_mb"),
                 "gpu_tput": rec.get("gpu_throughput"), "cpu_lat_ms": rec.get("cpu_latency_ms"),
                 "peak_mem_b": rec.get("peak_gpu_mem_b"),
+                "run_wall_s": rec.get("run_wall_s"),
             })
 
 if not rows:
@@ -416,15 +421,40 @@ if ds_summary is not None: pieces.append(_align(ds_summary, display_cols))
 pieces.append(_align(overall_df, display_cols))
 summary = pd.concat(pieces)
 
-print(f"\n{'=' * 140}")
-print(f"  EfficientAD-S  (N={N_RUNS}, PDN teacher_out=384, max_steps=70000)")
-print(f"  Raw CSV: {csv_path}")
-print(f"{'=' * 140}")
-print(summary.to_string(float_format=lambda x: f"{x:.1f}" if pd.notna(x) else "—"))
+lines = []
+lines.append("=" * 140)
+lines.append(f"  EfficientAD-S  (N={N_RUNS}, PDN teacher_out=384, max_steps=70000)")
+lines.append(f"  Raw CSV: {csv_path}")
+lines.append("=" * 140)
+lines.append(summary.to_string(float_format=lambda x: f"{x:.1f}" if pd.notna(x) else "—"))
 
+lines.append("")
+lines.append("=" * 80)
+lines.append("  Timing")
+lines.append("=" * 80)
+lines.append(f"  Total wall:        {total_secs:.1f} s  ({total_secs/60:.1f} min)")
+for i, c in enumerate(cycle_secs, 1):
+    lines.append(f"  Cycle {i}/{N_RUNS} wall:    {c:.1f} s  ({c/60:.1f} min)")
+if "run_wall_s" in df.columns:
+    rw = df["run_wall_s"].dropna()
+    if len(rw):
+        lines.append(f"  Per-run wall:      mean {rw.mean():.1f} s  min {rw.min():.1f}  max {rw.max():.1f}")
+
+lines.append("")
+lines.append("=" * 80)
 if oom_skips:
-    print(f"\n{'=' * 80}\n  OOM Skips ({len(oom_skips)} total)\n{'=' * 80}")
-    for s in oom_skips: print(f"  • {s['ds']}/{s['category']}  run {s['run']}")
+    lines.append(f"  OOM Skips ({len(oom_skips)} total)")
+    lines.append("=" * 80)
+    for s in oom_skips:
+        wall = s.get("wall_s")
+        wall_str = f"  ({wall:.1f}s before OOM)" if wall is not None else ""
+        lines.append(f"  • {s['ds']}/{s['category']}  run {s['run']}{wall_str}")
 else:
-    print("\n  No OOM skips recorded.")
-print("=" * 80)
+    lines.append("  No OOM skips recorded.")
+lines.append("=" * 80)
+
+text = "\n".join(lines)
+print("\n" + text)
+with open(combined_txt, "w") as f:
+    f.write(text + "\n")
+print(f"\nSummary written to {combined_txt}")

@@ -21,7 +21,6 @@ WARNING: ViT-B/14 + 448×448 + batch=16 needs ≳ 24 GB VRAM. If you OOM,
 """
 
 import gc
-import json
 import logging
 import os
 import shutil
@@ -60,8 +59,8 @@ MVTEC_CATEGORIES = [
 ]
 
 os.makedirs("results", exist_ok=True)
-PROGRESS_FILE = "results/dinomaly_muad_progress.json"
 csv_path = "results/dinomaly_muad_results.csv"
+combined_txt = "results/dinomaly_muad_combined.txt"
 CKPT_DIR = "results/Dinomaly"
 
 # ── Helpers ───────────────────────────────────────────────────
@@ -144,16 +143,20 @@ print(f"  Device: {gpu_info}")
 print("=" * 60)
 
 # ── Resume ────────────────────────────────────────────────────
-if os.path.exists(PROGRESS_FILE):
-    with open(PROGRESS_FILE) as f:
-        results = json.load(f)
-    print(f"\n[resume] Loaded {PROGRESS_FILE}")
+results = {"mvtec": {}}
+if os.path.exists(csv_path):
+    prior = pd.read_csv(csv_path)
+    for _, r in prior.iterrows():
+        cat = r["category"]
+        results["mvtec"].setdefault(cat, []).append(r.to_dict())
+    print(f"\n[resume] Loaded {len(prior)} prior rows from {csv_path}")
 else:
-    results = {"mvtec": {}}
-    print("\n[start] No checkpoint found — starting fresh.")
+    print("\n[start] No CSV found — starting fresh.")
 
 # ── Main: per-run train + per-category eval ───────────────────
 oom_skips: list[dict] = []
+cycle_secs: list[float] = []
+t_total_start = time.time()
 
 for run_idx in range(N_RUNS):
     runs_done_min = min(
@@ -166,6 +169,7 @@ for run_idx in range(N_RUNS):
     print(f"\n{'='*60}")
     print(f"  Run {run_idx+1}/{N_RUNS}  —  training MUAD model")
     print(f"{'='*60}")
+    t_cycle_start = time.time()
 
     train_evaluator = make_evaluator()
     print(f"  → Building merged datamodule ({len(MVTEC_CATEGORIES)} cats)...")
@@ -216,6 +220,7 @@ for run_idx in range(N_RUNS):
             train_batch_size=16,
             eval_batch_size=16,
         )
+        t_run_start = time.time()
         try:
             t0 = time.time()
             test_results = engine.test(model=model, datamodule=cat_dm)
@@ -223,7 +228,8 @@ for run_idx in range(N_RUNS):
         except RuntimeError as e:
             if "out of memory" in str(e).lower():
                 print(f"  [OOM] eval OOM on {category}. Skipping.")
-                oom_skips.append({"phase": "test", "run": run_idx + 1, "category": category})
+                oom_skips.append({"phase": "test", "run": run_idx + 1, "category": category,
+                                   "wall_s": time.time() - t_run_start})
                 free_gpu()
                 continue
             raise
@@ -237,6 +243,7 @@ for run_idx in range(N_RUNS):
         print(f"    Img AUROC {img_auc:.1f}%  Pxl AUROC {pxl_auc:.1f}%  AUPRO {pxl_pro:.1f}%"
               f"  ({elapsed:.1f}s)")
 
+        run_wall_s = time.time() - t_run_start
         run_record = {
             "image_AUROC":     img_auc,
             "pixel_AUROC":     pxl_auc,
@@ -246,10 +253,9 @@ for run_idx in range(N_RUNS):
             "n_params":        n_params,
             "inference_gpu_s": elapsed,
             "train_secs":      train_secs,
+            "run_wall_s":      run_wall_s,
         }
         results["mvtec"][category].append(run_record)
-        with open(PROGRESS_FILE, "w") as f:
-            json.dump(results, f, indent=2)
 
         csv_row = {"dataset": "mvtec", "category": category, "run": run_idx + 1, **run_record}
         pd.DataFrame([csv_row]).to_csv(
@@ -263,16 +269,15 @@ for run_idx in range(N_RUNS):
     free_gpu()
     shutil.rmtree(CKPT_DIR, ignore_errors=True)
     shutil.rmtree("lightning_logs", ignore_errors=True)
+    cycle_secs.append(time.time() - t_cycle_start)
+    print(f"\n  Cycle {run_idx+1}/{N_RUNS} complete in {cycle_secs[-1]:.1f}s ({cycle_secs[-1]/60:.1f} min)")
+
+total_secs = time.time() - t_total_start
 
 # ── Summary ───────────────────────────────────────────────────
 print(f"\n{'='*60}")
-print(f"  All MUAD runs complete.")
+print(f"  All MUAD runs complete in {total_secs:.1f}s ({total_secs/60:.1f} min)")
 print(f"{'='*60}")
-
-if oom_skips:
-    print(f"\n  [OOM] {len(oom_skips)} skip(s):")
-    for s in oom_skips:
-        print(f"    • {s}")
 
 # ── Tables ────────────────────────────────────────────────────
 def _mean(runs, key):
@@ -334,14 +339,35 @@ if cat_avg:
     )
 
 lines.append("=" * 80)
+
+# Timing block
+lines.append("")
+lines.append("=" * 80)
+lines.append("  Timing")
+lines.append("=" * 80)
+lines.append(f"  Total wall:        {total_secs:.1f} s  ({total_secs/60:.1f} min)")
+for i, c in enumerate(cycle_secs, 1):
+    lines.append(f"  Cycle {i}/{N_RUNS} wall:    {c:.1f} s  ({c/60:.1f} min)")
+all_wall = [r.get("run_wall_s") for runs in results["mvtec"].values() for r in runs if r.get("run_wall_s") is not None]
+if all_wall:
+    mn, mx, mean = min(all_wall), max(all_wall), sum(all_wall) / len(all_wall)
+    lines.append(f"  Per-cat eval wall: mean {mean:.1f} s  min {mn:.1f}  max {mx:.1f}")
+
+# OOM block
+lines.append("")
+lines.append("=" * 80)
+if oom_skips:
+    lines.append(f"  OOM Skips ({len(oom_skips)} total)")
+    lines.append("=" * 80)
+    for s in oom_skips:
+        lines.append(f"  • {s}")
+else:
+    lines.append("  No OOM skips recorded.")
+lines.append("=" * 80)
+
 output = "\n".join(lines)
 print(output)
 
-with open("results/dinomaly_muad_combined.txt", "w") as f:
-    f.write(output)
-
-if os.path.exists(PROGRESS_FILE) and all(
-    len(results["mvtec"].get(c, [])) >= N_RUNS for c in MVTEC_CATEGORIES
-):
-    os.remove(PROGRESS_FILE)
-    print(f"\n  Checkpoint deleted ({PROGRESS_FILE}).")
+with open(combined_txt, "w") as f:
+    f.write(output + "\n")
+print(f"\nSummary written to {combined_txt}")
