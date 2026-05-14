@@ -1,5 +1,5 @@
 """
-PatchCore-25%
+PatchCore-1%
 
 Usage:
     python patchcore.py          # 1 run (default)
@@ -156,7 +156,7 @@ CKPT_DIR = "results/Patchcore"
 
 # ── Startup banner ────────────────────────────────────────────
 print("=" * 60)
-print("  PatchCore-25%  |  WideResNet-50  |  Layers 2+3  |  Coreset 25%")
+print("  PatchCore-1%  |  WideResNet-50  |  Layers 2+3  |  Coreset 1%")
 print(f"  Runs per category : {N_RUNS}")
 print(f"  Categories total  : {total_categories}  ({len(MVTEC_CATEGORIES)} MVTec + {len(VISA_CATEGORIES)} VisA)")
 gpu_info = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU only"
@@ -228,8 +228,8 @@ for run in range(N_RUNS):
                     # (§4.4.1, Fig.4 bottom): "2+3, which is chosen as the default setting"
                     layers=["layer2", "layer3"],
                     pre_trained=True,
-                    # (§3.2, Table 1): PatchCore-25% = 25% coreset subsampling
-                    coreset_sampling_ratio=0.25,
+                    # (§3.2, Table 1): PatchCore-1% = 1% coreset subsampling
+                    coreset_sampling_ratio=0.01,
                     # (Eq.7): num_neighbors b for re-weighting (anomalib default=9)
                     # Paper's NN parameter p=3 is internal to coreset scoring and not
                     # surfaced by anomalib 2.3.2 (uses Eq.7 b=9 only).
@@ -440,7 +440,7 @@ pieces.append(_align(overall_df, display_cols))
 summary = pd.concat(pieces)
 
 print(f"\n{'=' * 140}")
-print(f"  PatchCore-25%  (N={N_RUNS}, Backbone: WideResNet-50, Layers: 2+3, Coreset: `are all th`%)")
+print(f"  PatchCore-1%  (N={N_RUNS}, Backbone: WideResNet-50, Layers: 2+3, Coreset: 1%)")
 print(f"  Raw CSV: {csv_path}")
 print(f"{'=' * 140}")
 print(summary.to_string(float_format=lambda x: f"{x:.1f}" if pd.notna(x) else "—"))
