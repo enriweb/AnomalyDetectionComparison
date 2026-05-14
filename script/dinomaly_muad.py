@@ -24,6 +24,7 @@ import gc
 import json
 import logging
 import os
+import shutil
 import statistics
 import sys
 import threading
@@ -35,6 +36,7 @@ os.environ["PYTHONWARNINGS"] = "ignore"
 for _log in ("lightning", "lightning.pytorch", "anomalib", "torchvision", "torch"):
     logging.getLogger(_log).setLevel(logging.ERROR)
 print("Importing torch-related libraries...")
+import pandas as pd
 import torch
 from anomalib.data import MVTecAD
 from anomalib.data.datasets.image.mvtecad import MVTecADDataset
@@ -59,6 +61,8 @@ MVTEC_CATEGORIES = [
 
 os.makedirs("results", exist_ok=True)
 PROGRESS_FILE = "results/dinomaly_muad_progress.json"
+csv_path = "results/dinomaly_muad_results.csv"
+CKPT_DIR = "results/Dinomaly"
 
 # ── Helpers ───────────────────────────────────────────────────
 def free_gpu() -> None:
@@ -233,7 +237,7 @@ for run_idx in range(N_RUNS):
         print(f"    Img AUROC {img_auc:.1f}%  Pxl AUROC {pxl_auc:.1f}%  AUPRO {pxl_pro:.1f}%"
               f"  ({elapsed:.1f}s)")
 
-        results["mvtec"][category].append({
+        run_record = {
             "image_AUROC":     img_auc,
             "pixel_AUROC":     pxl_auc,
             "pixel_AUPRO":     pxl_pro,
@@ -242,13 +246,23 @@ for run_idx in range(N_RUNS):
             "n_params":        n_params,
             "inference_gpu_s": elapsed,
             "train_secs":      train_secs,
-        })
+        }
+        results["mvtec"][category].append(run_record)
         with open(PROGRESS_FILE, "w") as f:
             json.dump(results, f, indent=2)
+
+        csv_row = {"dataset": "mvtec", "category": category, "run": run_idx + 1, **run_record}
+        pd.DataFrame([csv_row]).to_csv(
+            csv_path, mode="a",
+            header=not os.path.exists(csv_path),
+            index=False,
+        )
         free_gpu()
 
     del model, engine, merged_dm, train_evaluator
     free_gpu()
+    shutil.rmtree(CKPT_DIR, ignore_errors=True)
+    shutil.rmtree("lightning_logs", ignore_errors=True)
 
 # ── Summary ───────────────────────────────────────────────────
 print(f"\n{'='*60}")

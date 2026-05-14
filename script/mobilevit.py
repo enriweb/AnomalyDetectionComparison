@@ -22,6 +22,7 @@ import gc
 import json
 import logging
 import os
+import shutil
 import sys
 import time
 import warnings
@@ -146,6 +147,8 @@ total_categories = sum(len(c) for _, _, c, _ in DATASETS)
 
 os.makedirs("results", exist_ok=True)
 PROGRESS_FILE = "results/mobilevit_progress.json"
+csv_path = "results/mobilevit_results.csv"
+CKPT_DIR = "results/Patchcore"
 
 # ── Startup banner ────────────────────────────────────────────
 print("=" * 60)
@@ -316,6 +319,13 @@ for run in range(N_RUNS):
 
                 with open(PROGRESS_FILE, "w") as f:
                     json.dump(results, f, indent=2)
+
+                csv_row = {"dataset": ds_name, "category": category, "run": run + 1, **run_record}
+                pd.DataFrame([csv_row]).to_csv(
+                    csv_path, mode="a",
+                    header=not os.path.exists(csv_path),
+                    index=False,
+                )
                 print(f"  → Checkpoint saved.")
 
             except Exception as e:
@@ -332,6 +342,8 @@ for run in range(N_RUNS):
                 del image_auroc, pixel_auroc, pixel_pro, image_f1max, pixel_f1max
                 del test_results, metrics
                 free_gpu()
+                shutil.rmtree(CKPT_DIR, ignore_errors=True)
+                shutil.rmtree("lightning_logs", ignore_errors=True)
 
 # ── Post-loop: clean up checkpoint ───────────────────────────
 print(f"\n{'='*60}")
@@ -364,8 +376,6 @@ if not rows:
     sys.exit(0)
 
 df = pd.DataFrame(rows)
-csv_path = "results/mobilevit_results.csv"
-df.to_csv(csv_path, index=False)
 
 metric_cols = ["img_auroc", "pxl_auroc", "aupro", "img_f1max", "pxl_f1max",
                "params", "flops_M", "inf_s", "peak_gpu_mb",
