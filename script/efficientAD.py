@@ -115,6 +115,31 @@ def _peak_gpu_mem(model,
     torch.cuda.synchronize()
     return int(torch.cuda.max_memory_allocated())
 
+
+@torch.no_grad()
+def _single_image_latency_ms(model,
+                             input_shape: tuple = (1, 3, 224, 224),
+                             warmup: int = 20,
+                             iters: int = 200):
+    """Mean single-image GPU forward latency in ms (CUDA events, batch=1)."""
+    if not torch.cuda.is_available():
+        return None
+    _model = model.cuda().eval()
+    x = torch.randn(*input_shape, device="cuda")
+    for _ in range(warmup):
+        _model(x)
+    torch.cuda.synchronize()
+    times = []
+    for _ in range(iters):
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        _model(x)
+        end.record()
+        torch.cuda.synchronize()
+        times.append(start.elapsed_time(end))
+    return sum(times) / len(times)
+
 # ── Single-line progress bar ──────────────────────────────────
 class CompactBar(TQDMProgressBar):
     def init_train_tqdm(self):
@@ -283,6 +308,12 @@ for run in range(N_RUNS):
                 except Exception:
                     peak_mem_1fwd = None
 
+                try:
+                    single_lat = _single_image_latency_ms(extractor, input_shape=input_shape)
+                    print(f"  -> Single-img latency: {single_lat:.3f} ms" if single_lat else "")
+                except Exception:
+                    single_lat = None
+
                 # ── GPU inference on test set ─────────────────────────
                 print(f"  → Running inference on test set (GPU)...")
                 if torch.cuda.is_available():
@@ -319,6 +350,7 @@ for run in range(N_RUNS):
                     "gpu_throughput":  gpu_tput,
                     "cpu_latency_ms":  cpu_lat,
                     "peak_gpu_mem_b":  peak_mem_1fwd,
+                    "single_img_lat_ms": single_lat,
                     "run_wall_s":      run_wall_s,
                 }
                 results[ds_name][category].append(run_record)
@@ -372,6 +404,7 @@ for ds_name, _, categories, _ in DATASETS:
                 "inf_s": rec.get("inference_gpu_s"), "peak_gpu_mb": rec.get("peak_gpu_mb"),
                 "gpu_tput": rec.get("gpu_throughput"), "cpu_lat_ms": rec.get("cpu_latency_ms"),
                 "peak_mem_b": rec.get("peak_gpu_mem_b"),
+                "single_lat_ms": rec.get("single_img_lat_ms"),
                 "run_wall_s": rec.get("run_wall_s"),
             })
 
@@ -383,7 +416,7 @@ df = pd.DataFrame(rows)
 
 metric_cols = ["img_auroc", "pxl_auroc", "aupro", "img_f1max", "pxl_f1max",
                "params", "flops_M", "inf_s", "peak_gpu_mb",
-               "gpu_tput", "cpu_lat_ms", "peak_mem_b"]
+               "gpu_tput", "cpu_lat_ms", "peak_mem_b", "single_lat_ms"]
 
 if N_RUNS > 1:
     cat_agg = df.groupby(["dataset", "category"])[metric_cols].agg(["mean", "std"])
