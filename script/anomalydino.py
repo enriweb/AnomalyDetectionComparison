@@ -46,6 +46,9 @@ torch.set_float32_matmul_precision('high')
 # - Config -------------------------------------------------------------------
 N_RUNS: int = int(sys.argv[1]) if len(sys.argv) > 1 else 1
 
+# Few-shot regime (paper). k reference images per category.
+K_SHOT: int = 8
+
 # - GPU helpers --------------------------------------------------------------
 def free_gpu() -> None:
     gc.collect()
@@ -112,6 +115,31 @@ def _peak_gpu_mem(model,
     torch.cuda.synchronize()
     return int(torch.cuda.max_memory_allocated())
 
+
+@torch.no_grad()
+def _single_image_latency_ms(model,
+                             input_shape: tuple = (1, 3, 224, 224),
+                             warmup: int = 20,
+                             iters: int = 200):
+    """Mean single-image GPU forward latency in ms (CUDA events, batch=1)."""
+    if not torch.cuda.is_available():
+        return None
+    _model = model.cuda().eval()
+    x = torch.randn(*input_shape, device="cuda")
+    for _ in range(warmup):
+        _model(x)
+    torch.cuda.synchronize()
+    times = []
+    for _ in range(iters):
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        _model(x)
+        end.record()
+        torch.cuda.synchronize()
+        times.append(start.elapsed_time(end))
+    return sum(times) / len(times)
+
 # - Single-line progress bar -------------------------------------------------
 class CompactBar(TQDMProgressBar):
     def init_train_tqdm(self):
@@ -139,6 +167,14 @@ DATASETS = [
     ("visa",  Visa,    VISA_CATEGORIES,  "./datasets/VisA"),
 ]
 
+# Per-category masking (paper: object categories masked, textures not).
+# MVTec set per anomalib reference impl. VisA categories all discrete
+# objects on background -> all masked.
+MASKED = {
+    "mvtec": {"capsule", "hazelnut", "pill", "screw", "toothbrush"},
+    "visa":  set(VISA_CATEGORIES),
+}
+
 total_categories = sum(len(c) for _, _, c, _ in DATASETS)
 
 os.makedirs("results", exist_ok=True)
@@ -149,7 +185,7 @@ CKPT_DIR = "results/AnomalyDino"
 # - Startup banner -----------------------------------------------------------
 print("=" * 60)
 print("  AnomalyDINO  |  Encoder: dinov2_vit_small_14")
-print("  neighbours=1  |  coreset=True  |  ratio=0.25  |  masking=True")
+print(f"  neighbours=1  |  coreset=False  |  masking=per-category  |  k-shot={K_SHOT}")
 print(f"  Runs per category : {N_RUNS}")
 print(f"  Categories total  : {total_categories}  ({len(MVTEC_CATEGORIES)} MVTec + {len(VISA_CATEGORIES)} VisA)")
 gpu_info = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU only"
@@ -204,9 +240,20 @@ for run in range(N_RUNS):
                 datamodule = DataModule(
                     root=root,
                     category=category,
-                    train_batch_size=32,
+                    train_batch_size=K_SHOT,
                     eval_batch_size=32,
                 )
+
+                # Few-shot: subsample nominal train set to K_SHOT references.
+                datamodule.setup()
+                train_ds = datamodule.train_data
+                if len(train_ds.samples) > K_SHOT:
+                    train_ds.samples = (
+                        train_ds.samples
+                        .sample(n=K_SHOT, random_state=run)
+                        .reset_index(drop=True)
+                    )
+                print(f"  -> Few-shot references: {len(train_ds.samples)}")
 
                 image_auroc = AUROC(fields=["pred_score", "gt_label"], prefix="image_")
                 pixel_auroc = AUROC(fields=["anomaly_map", "gt_mask"],  prefix="pixel_")
@@ -216,13 +263,13 @@ for run in range(N_RUNS):
                 evaluator = Evaluator(test_metrics=[image_auroc, pixel_auroc, pixel_pro,
                                                     image_f1max, pixel_f1max])
 
-                print(f"  -> Building model (dinov2_vit_small_14)...")
+                mask = category in MASKED[ds_name]
+                print(f"  -> Building model (dinov2_vit_small_14, masking={mask})...")
                 model = AnomalyDINO(
                     encoder_name="dinov2_vit_small_14",
                     num_neighbours=1,
-                    masking=True,
-                    coreset_subsampling=True,
-                    sampling_ratio=0.25,
+                    masking=mask,
+                    coreset_subsampling=False,
                     evaluator=evaluator,
                     visualizer=False,
                 )
@@ -236,7 +283,7 @@ for run in range(N_RUNS):
                 print(f"  -> Memory bank built.")
 
                 extractor = model.model.feature_encoder
-                input_shape = (1, 3, 224, 224)
+                input_shape = (1, 3, 252, 252)
 
                 try:
                     gpu_tput = _gpu_throughput(extractor, input_shape=input_shape, batch=8)
@@ -255,6 +302,12 @@ for run in range(N_RUNS):
                     print(f"  -> Peak mem (1 fwd): {peak_mem_1fwd/1e6:.1f} MB" if peak_mem_1fwd else "")
                 except Exception:
                     peak_mem_1fwd = None
+
+                try:
+                    single_lat = _single_image_latency_ms(extractor, input_shape=input_shape)
+                    print(f"  -> Single-img latency: {single_lat:.3f} ms" if single_lat else "")
+                except Exception:
+                    single_lat = None
 
                 # -- GPU inference on test set ---------------------------------
                 print(f"  -> Running inference on test set (GPU)...")
@@ -295,6 +348,7 @@ for run in range(N_RUNS):
                     "gpu_throughput":  gpu_tput,
                     "cpu_latency_ms":  cpu_lat,
                     "peak_gpu_mem_b":  peak_mem_1fwd,
+                    "single_img_lat_ms": single_lat,
                     "run_wall_s":      run_wall_s,
                 }
                 results[ds_name][category].append(run_record)
@@ -348,6 +402,7 @@ for ds_name, _, categories, _ in DATASETS:
                 "inf_s": rec.get("inference_gpu_s"), "peak_gpu_mb": rec.get("peak_gpu_mb"),
                 "gpu_tput": rec.get("gpu_throughput"), "cpu_lat_ms": rec.get("cpu_latency_ms"),
                 "peak_mem_b": rec.get("peak_gpu_mem_b"),
+                "single_lat_ms": rec.get("single_img_lat_ms"),
                 "run_wall_s": rec.get("run_wall_s"),
             })
 
@@ -359,7 +414,7 @@ df = pd.DataFrame(rows)
 
 metric_cols = ["img_auroc", "pxl_auroc", "aupro", "img_f1max", "pxl_f1max",
                "params", "flops_M", "inf_s", "peak_gpu_mb",
-               "gpu_tput", "cpu_lat_ms", "peak_mem_b"]
+               "gpu_tput", "cpu_lat_ms", "peak_mem_b", "single_lat_ms"]
 
 if N_RUNS > 1:
     cat_agg = df.groupby(["dataset", "category"])[metric_cols].agg(["mean", "std"])
@@ -399,7 +454,7 @@ summary = pd.concat(pieces)
 
 lines = []
 lines.append("=" * 140)
-lines.append(f"  AnomalyDINO  (N={N_RUNS}, Encoder: dinov2_vit_small_14, Neighbours: 1, Coreset: 0.25, Masking: True)")
+lines.append(f"  AnomalyDINO  (N={N_RUNS}, Encoder: dinov2_vit_small_14, Neighbours: 1, Coreset: off, Masking: per-category, k-shot: {K_SHOT})")
 lines.append(f"  Raw CSV: {csv_path}")
 lines.append("=" * 140)
 lines.append(summary.to_string(float_format=lambda x: f"{x:.1f}" if pd.notna(x) else "—"))
