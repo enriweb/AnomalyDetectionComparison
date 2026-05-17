@@ -176,7 +176,7 @@ CKPT_DIR = "results/Patchcore"
 
 # ── Startup banner ────────────────────────────────────────────
 print("=" * 60)
-print("  PatchCore + MobileViT-S  |  Layers: stages.2.0+stages.3.0  |  Coreset: 25%")
+print("  PatchCore + MobileViT-S  |  Layers: stages.2+stages.3  |  Coreset: 25%")
 print(f"  Runs per category : {N_RUNS}")
 print(f"  Categories total  : {total_categories}  ({len(MVTEC_CATEGORIES)} MVTec + {len(VISA_CATEGORIES)} VisA)")
 gpu_info = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU only"
@@ -249,7 +249,7 @@ for run in range(N_RUNS):
                 model = Patchcore(
                     # MobileViT-S (ICLR 2022): lightweight ViT backbone
                     backbone="mobilevit_s",
-                    layers=["stages.2.0", "stages.3.0"],
+                    layers=["stages.2", "stages.3"],
                     pre_trained=True,
                     # PatchCore paper (§3.2): 25% coreset subsampling
                     coreset_sampling_ratio=0.25,
@@ -466,7 +466,7 @@ summary = pd.concat(pieces)
 
 lines = []
 lines.append("=" * 140)
-lines.append(f"  PatchCore + MobileViT-S  (N={N_RUNS}, Backbone: mobilevit_s, Layers: stages.2.0+stages.3.0, Coreset: 25%)")
+lines.append(f"  PatchCore + MobileViT-S  (N={N_RUNS}, Backbone: mobilevit_s, Layers: stages.2+stages.3, Coreset: 25%)")
 lines.append(f"  Raw CSV: {csv_path}")
 lines.append("=" * 140)
 lines.append(summary.to_string(float_format=lambda x: f"{x:.1f}" if pd.notna(x) else "—"))

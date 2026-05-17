@@ -270,7 +270,7 @@ for run in range(N_RUNS):
 
                 print(f"  → Training (max_steps=70000)...")
                 # (§5, supplementary): training takes ~20 min per scenario
-                engine = Engine(max_steps=70000, devices="auto", strategy="auto", logger=False, callbacks=[CompactBar()])
+                engine = Engine(max_steps=70000, devices=1, logger=False, callbacks=[CompactBar()])
                 engine.fit(model=model, datamodule=datamodule)
                 print(f"  → Training complete.")
 
