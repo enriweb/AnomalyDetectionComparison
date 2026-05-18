@@ -8,16 +8,15 @@ Usage:
 Metrics recorded per run:
     Accuracy  — image AUROC, pixel AUROC, pixel AUPRO,
                 image F1Max (optimal threshold), pixel F1Max
-    Efficiency — n_params, FLOPs (backbone, thop optional),
-                 inference time GPU (MobileViT-S backbone),
-                 peak + mean GPU MB
+    Efficiency — n_params, FLOPs (backbone, thop optional), peak GPU MB,
+                 deploy latency (raw frame -> anomaly decision, batch=1):
+                 total mean/p95/p99 + per-stage pre/fwd/post breakdown
 
 Progress is checkpointed to results/mobilevit_progress.json after every
 completed run. On normal exit the checkpoint is deleted. On crash / OOM
 the checkpoint survives and the next invocation auto-resumes.
 """
 
-import copy
 import gc
 import logging
 import os
@@ -57,47 +56,54 @@ def free_gpu() -> None:
 
 # ── Inline efficiency helpers ─────────────────────────────────
 @torch.no_grad()
-def _gpu_throughput(model,
-                    input_shape: tuple = (1, 3, 224, 224),
-                    batch: int = 8,
-                    warmup: int = 10,
-                    iters: int = 50):
-    """Images per second on CUDA. Returns None if no GPU."""
+def _deploy_latency(model, raw_image, device="cuda", warmup=20, iters=200):
+    """Per-image deployment latency: raw camera frame -> anomaly decision.
+
+    Times the conveyor-belt inference path at batch=1:
+        preprocess  -- model.pre_processor: resize + normalize (CPU)
+        h2d         -- host -> GPU copy
+        forward     -- model.model: features + scoring/kNN + anomaly map
+        postprocess -- model.post_processor: normalize + threshold -> decision
+
+    raw_image : single CHW float tensor on CPU (one real test image at native
+                resolution -- simulates an arriving camera frame).
+    Returns {stage: {mean,p50,p95,p99}} in ms for pre/h2d/fwd/post/total,
+    or None if CUDA unavailable. perf_counter + cuda.synchronize because the
+    pipeline mixes CPU and GPU work.
+    """
     if not torch.cuda.is_available():
         return None
-    _model = model.cuda().eval()
-    _, c, h, w = input_shape
-    x = torch.randn(batch, c, h, w, device="cuda")
-    for _ in range(warmup):
-        _model(x)
-    torch.cuda.synchronize()
-    t0 = time.perf_counter()
-    for _ in range(iters):
-        _model(x)
-    torch.cuda.synchronize()
-    return (batch * iters) / (time.perf_counter() - t0)
+    inner = model.model.to(device).eval()
+    pre   = model.pre_processor
+    post  = model.post_processor.to(device)
+    raw   = raw_image.unsqueeze(0)  # (1,C,H,W), CPU
 
-
-@torch.no_grad()
-def _cpu_latency(model,
-                 input_shape: tuple = (1, 3, 224, 224),
-                 warmup: int = 5,
-                 iters: int = 20):
-    """Mean ms per single-image forward on CPU."""
-    prev_threads = torch.get_num_threads()
-    torch.set_num_threads(1)
-    cpu_model = copy.deepcopy(model).cpu().eval()
-    x = torch.randn(*input_shape)
-    try:
-        for _ in range(warmup):
-            cpu_model(x)
+    def _one():
         t0 = time.perf_counter()
-        for _ in range(iters):
-            cpu_model(x)
-        return (time.perf_counter() - t0) / iters * 1000.0
-    finally:
-        torch.set_num_threads(prev_threads)
-        del cpu_model
+        x = pre(raw)
+        t1 = time.perf_counter()
+        x = x.to(device); torch.cuda.synchronize()
+        t2 = time.perf_counter()
+        out = inner(x); torch.cuda.synchronize()
+        t3 = time.perf_counter()
+        post(out); torch.cuda.synchronize()
+        t4 = time.perf_counter()
+        return (t1-t0, t2-t1, t3-t2, t4-t3, t4-t0)
+
+    for _ in range(warmup):
+        _one()
+    keys = ("pre", "h2d", "fwd", "post", "total")
+    acc = {k: [] for k in keys}
+    for _ in range(iters):
+        for k, s in zip(keys, _one()):
+            acc[k].append(s * 1e3)
+
+    def _stat(v):
+        v = sorted(v); n = len(v)
+        return {"mean": sum(v)/n, "p50": v[n//2],
+                "p95": v[min(n-1, int(n*0.95))],
+                "p99": v[min(n-1, int(n*0.99))]}
+    return {k: _stat(v) for k, v in acc.items()}
 
 
 @torch.no_grad()
@@ -113,31 +119,6 @@ def _peak_gpu_mem(model,
     _model(x)
     torch.cuda.synchronize()
     return int(torch.cuda.max_memory_allocated())
-
-
-@torch.no_grad()
-def _single_image_latency_ms(model,
-                             input_shape: tuple = (1, 3, 224, 224),
-                             warmup: int = 20,
-                             iters: int = 200):
-    """Mean single-image GPU forward latency in ms (CUDA events, batch=1)."""
-    if not torch.cuda.is_available():
-        return None
-    _model = model.cuda().eval()
-    x = torch.randn(*input_shape, device="cuda")
-    for _ in range(warmup):
-        _model(x)
-    torch.cuda.synchronize()
-    times = []
-    for _ in range(iters):
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
-        _model(x)
-        end.record()
-        torch.cuda.synchronize()
-        times.append(start.elapsed_time(end))
-    return sum(times) / len(times)
 
 
 # ── Single-line progress bar ──────────────────────────────────
@@ -289,41 +270,34 @@ for run in range(N_RUNS):
                 input_shape = (1, 3, 224, 224)
 
                 try:
-                    gpu_tput = _gpu_throughput(extractor, input_shape=input_shape, batch=8)
-                    print(f"  → GPU throughput: {gpu_tput:.1f} img/s" if gpu_tput else "")
-                except Exception:
-                    gpu_tput = None
-
-                try:
-                    cpu_lat = _cpu_latency(extractor, input_shape=input_shape)
-                    print(f"  → CPU latency: {cpu_lat:.1f} ms" if cpu_lat else "")
-                except Exception:
-                    cpu_lat = None
-
-                try:
                     peak_mem_1fwd = _peak_gpu_mem(extractor, input_shape=input_shape)
                     print(f"  → Peak mem (1 fwd): {peak_mem_1fwd/1e6:.1f} MB" if peak_mem_1fwd else "")
                 except Exception:
                     peak_mem_1fwd = None
-
-                try:
-                    single_lat = _single_image_latency_ms(extractor, input_shape=input_shape)
-                    print(f"  -> Single-img latency: {single_lat:.3f} ms" if single_lat else "")
-                except Exception:
-                    single_lat = None
 
                 # ── GPU inference on test set ──────────────────────────────────
                 print(f"  → Running inference on test set (GPU)...")
                 if torch.cuda.is_available():
                     torch.cuda.reset_peak_memory_stats()
 
-                t0 = time.time()
                 test_results = engine.test(model=model, datamodule=datamodule)
-                elapsed_gpu = time.time() - t0
 
                 peak_gpu_mb = 0.0
                 if torch.cuda.is_available():
                     peak_gpu_mb = round(torch.cuda.max_memory_allocated() / 1e6, 1)
+
+                # ── Deployment latency: raw frame -> anomaly decision ──────────
+                try:
+                    raw_img = datamodule.test_data[0].image
+                    deploy = _deploy_latency(model, raw_img)
+                except Exception:
+                    deploy = None
+                if deploy:
+                    t = deploy["total"]
+                    print(f"  → Deploy latency: {t['mean']:.2f} ms  "
+                          f"(p95 {t['p95']:.2f}, p99 {t['p99']:.2f})  "
+                          f"[pre {deploy['pre']['mean']:.2f} | fwd {deploy['fwd']['mean']:.2f} "
+                          f"| post {deploy['post']['mean']:.2f}]")
 
                 metrics = test_results[0]
                 img_auc  = metrics.get("image_AUROC", 0) * 100
@@ -335,7 +309,7 @@ for run in range(N_RUNS):
                 print(f"  → Results: Img AUROC {img_auc:.1f}% | Pxl AUROC {pxl_auc:.1f}%"
                       f" | AUPRO {pxl_pro:.1f}%"
                       + (f" | F1Max {img_f1:.1f}%" if img_f1 is not None else ""))
-                print(f"  → GPU inf: {elapsed_gpu:.3f}s  |  Peak GPU: {peak_gpu_mb:.1f} MB")
+                print(f"  → Peak GPU: {peak_gpu_mb:.1f} MB")
 
                 run_wall_s = time.time() - t_run_start
                 run_record = {
@@ -346,12 +320,15 @@ for run in range(N_RUNS):
                     "pixel_F1Max":     pxl_f1,
                     "n_params":        n_params,
                     "flops_M":         flops_M,
-                    "inference_gpu_s": elapsed_gpu,
                     "peak_gpu_mb":     peak_gpu_mb,
-                    "gpu_throughput":  gpu_tput,
-                    "cpu_latency_ms":  cpu_lat,
                     "peak_gpu_mem_b":  peak_mem_1fwd,
-                    "single_img_lat_ms": single_lat,
+                    "deploy_total_ms":     deploy["total"]["mean"] if deploy else None,
+                    "deploy_total_p95_ms": deploy["total"]["p95"]  if deploy else None,
+                    "deploy_total_p99_ms": deploy["total"]["p99"]  if deploy else None,
+                    "deploy_pre_ms":       deploy["pre"]["mean"]   if deploy else None,
+                    "deploy_h2d_ms":       deploy["h2d"]["mean"]   if deploy else None,
+                    "deploy_fwd_ms":       deploy["fwd"]["mean"]   if deploy else None,
+                    "deploy_post_ms":      deploy["post"]["mean"]  if deploy else None,
                     "run_wall_s":      run_wall_s,
                 }
                 results[ds_name][category].append(run_record)
@@ -402,10 +379,13 @@ for ds_name, _, categories, _ in DATASETS:
                 "aupro": rec.get("pixel_AUPRO"), "img_f1max": rec.get("image_F1Max"),
                 "pxl_f1max": rec.get("pixel_F1Max"),
                 "params": rec.get("n_params"), "flops_M": rec.get("flops_M"),
-                "inf_s": rec.get("inference_gpu_s"), "peak_gpu_mb": rec.get("peak_gpu_mb"),
-                "gpu_tput": rec.get("gpu_throughput"), "cpu_lat_ms": rec.get("cpu_latency_ms"),
+                "peak_gpu_mb": rec.get("peak_gpu_mb"),
                 "peak_mem_b": rec.get("peak_gpu_mem_b"),
-                "single_lat_ms": rec.get("single_img_lat_ms"),
+                "deploy_total_ms": rec.get("deploy_total_ms"),
+                "deploy_total_p95_ms": rec.get("deploy_total_p95_ms"),
+                "deploy_fwd_ms": rec.get("deploy_fwd_ms"),
+                "deploy_pre_ms": rec.get("deploy_pre_ms"),
+                "deploy_post_ms": rec.get("deploy_post_ms"),
                 "run_wall_s": rec.get("run_wall_s"),
             })
 
@@ -416,8 +396,9 @@ if not rows:
 df = pd.DataFrame(rows)
 
 metric_cols = ["img_auroc", "pxl_auroc", "aupro", "img_f1max", "pxl_f1max",
-               "params", "flops_M", "inf_s", "peak_gpu_mb",
-               "gpu_tput", "cpu_lat_ms", "peak_mem_b", "single_lat_ms"]
+               "params", "flops_M", "peak_gpu_mb", "peak_mem_b",
+               "deploy_total_ms", "deploy_total_p95_ms", "deploy_fwd_ms",
+               "deploy_pre_ms", "deploy_post_ms"]
 
 # Per-category aggregate (mean ± std when N_RUNS > 1)
 if N_RUNS > 1:
