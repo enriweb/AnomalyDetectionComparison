@@ -1,9 +1,9 @@
 """
-EfficientAD
+STFPM (Student-Teacher Feature Pyramid Matching) — Wang et al. 2021
 
 Usage:
-    python efficientAD.py          # 1 run (default)
-    python efficientAD.py 3        # 3 runs, results averaged
+    python stfpm.py          # 1 run (default)
+    python stfpm.py 3        # 3 runs, results averaged
 
 Metrics recorded per run:
     Accuracy  — image AUROC, pixel AUPRO,
@@ -12,11 +12,9 @@ Metrics recorded per run:
                  deploy latency (raw frame -> anomaly decision, batch=1):
                  total mean/p95/p99 + per-stage pre/fwd/post breakdown
 
-Progress is checkpointed to results/efficientad_{variant}_progress.json after
-every completed run. On normal exit the checkpoint is deleted. On crash / OOM
-the checkpoint survives and the next invocation auto-resumes.
-
-NOTE: EfficientAD requires train_batch_size=1 (anomalib constraint).
+Progress is checkpointed to results/stfpm_results.csv after every completed
+run. On normal exit the checkpoint is deleted. On crash / OOM the checkpoint
+survives and the next invocation auto-resumes.
 """
 
 import gc
@@ -38,7 +36,7 @@ import torch.nn as nn
 from anomalib.data import MVTecAD, Visa
 from anomalib.engine import Engine
 from anomalib.metrics import AUPRO, AUROC, F1Max, Evaluator
-from anomalib.models import EfficientAd
+from anomalib.models import Stfpm
 from lightning.pytorch.callbacks import TQDMProgressBar
 from torch.utils.flop_counter import FlopCounterMode
 import pandas as pd
@@ -47,6 +45,7 @@ torch.set_float32_matmul_precision('high')
 
 # ── Config ────────────────────────────────────────────────────
 N_RUNS: int = int(sys.argv[1]) if len(sys.argv) > 1 else 1
+MAX_EPOCHS: int = 100  # Wang et al. 2021 §4: 100 epochs
 
 # ── GPU helpers ───────────────────────────────────────────────
 def free_gpu() -> None:
@@ -63,7 +62,7 @@ def _deploy_latency(model, raw_image, device="cuda", warmup=20, iters=200):
     Times the conveyor-belt inference path at batch=1:
         preprocess  -- model.pre_processor: resize + normalize (CPU)
         h2d         -- host -> GPU copy
-        forward     -- model.model: features + scoring/kNN + anomaly map
+        forward     -- model.model: teacher+student features -> anomaly map
         postprocess -- model.post_processor: normalize + threshold -> decision
 
     raw_image : single CHW float tensor on CPU (one real test image at native
@@ -151,13 +150,13 @@ DATASETS = [
 total_categories = sum(len(c) for _, _, c, _ in DATASETS)
 
 os.makedirs("results", exist_ok=True)
-csv_path = "results/efficientad_s_results.csv"
-combined_txt = "results/efficientad_s_combined.txt"
-CKPT_DIR = "results/EfficientAd"
+csv_path = "results/stfpm_results.csv"
+combined_txt = "results/stfpm_combined.txt"
+CKPT_DIR = "results/Stfpm"
 
 # ── Startup banner ────────────────────────────────────────────
 print("=" * 60)
-print("  EfficientAD-S  |  PDN teacher_out=384  |  max_steps=70000")
+print(f"  STFPM  |  backbone=ResNet-18  |  layers=[layer1,layer2,layer3]  |  max_epochs={MAX_EPOCHS}")
 print(f"  Runs per category : {N_RUNS}")
 print(f"  Categories total  : {total_categories}  ({len(MVTEC_CATEGORIES)} MVTec + {len(VISA_CATEGORIES)} VisA)")
 gpu_info = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU only"
@@ -209,37 +208,29 @@ for run in range(N_RUNS):
             t_run_start = time.time()
             try:
                 print(f"  → Loading datamodule...")
-                # (§3.1): image size 256×256
-                # EfficientAD requires train_batch_size=1 (anomalib constraint)
+                # (§4): image size 256×256
                 datamodule = DataModule(
                     root=root,
                     category=category,
-                    train_batch_size=1,
+                    train_batch_size=32,
                     eval_batch_size=32,
                 )
 
-                # Image-level AU-ROC (Table 2)
+                # Image-level AU-ROC
                 image_auroc = AUROC(fields=["pred_score", "gt_label"], prefix="image_")
-                # Pixel-level AU-PRO (Table 1) — fpr_limit=0.3, matching §4
+                # Pixel-level AU-PRO — fpr_limit=0.3
                 pixel_pro = AUPRO(fields=["anomaly_map", "gt_mask"], prefix="pixel_")
                 image_f1max = F1Max(fields=["pred_score", "gt_label"], prefix="image_")
                 evaluator = Evaluator(test_metrics=[image_auroc, pixel_pro, image_f1max])
 
-                print(f"  → Building model (EfficientAD-S)...")
-                model = EfficientAd(
-                    # (§3.2): "we sample a random image P from the pretraining dataset"
-                    # imagenet_dir="./datasets/imagenette",
-                    # (Fig.2): PDN output channels = 384
-                    teacher_out_channels=384,
-                    # (supplementary): learning rate = 1e-4
-                    lr=1e-4,
-                    # (supplementary): weight decay = 1e-5
-                    weight_decay=1e-5,
-                    # (§3.1): PDN has no padding — receptive field exactly 33×33
-                    padding=False,
-                    pad_maps=True,
-                    # (§3.1): "we resize all input images to 256×256 pixels"
-                    pre_processor=EfficientAd.configure_pre_processor(
+                print(f"  → Building model (STFPM ResNet-18)...")
+                model = Stfpm(
+                    # (§3.1): ResNet-18 teacher/student
+                    backbone="resnet18",
+                    # (§3.2): first 3 residual blocks for feature pyramid
+                    layers=("layer1", "layer2", "layer3"),
+                    # (§4): "all images are resized to 256×256"
+                    pre_processor=Stfpm.configure_pre_processor(
                         image_size=(256, 256),
                     ),
                     evaluator=evaluator,
@@ -249,26 +240,26 @@ for run in range(N_RUNS):
                 n_params = sum(p.numel() for p in model.parameters())
                 print(f"  → Parameters: {n_params:,}")
 
-                print(f"  → Training (max_steps=70000)...")
-                # (§5, supplementary): training takes ~20 min per scenario
-                engine = Engine(max_steps=70000, devices=1, logger=False, callbacks=[CompactBar()])
+                print(f"  → Training (max_epochs={MAX_EPOCHS})...")
+                # (§4): SGD lr=0.4, momentum=0.9, weight_decay=1e-3, 100 epochs
+                engine = Engine(max_epochs=MAX_EPOCHS, devices=1, logger=False, callbacks=[CompactBar()])
                 engine.fit(model=model, datamodule=datamodule)
                 print(f"  → Training complete.")
 
-                # ── FLOPs: PDN student forward on one image (PyTorch native) ───────────
+                # ── FLOPs: student backbone forward on one image ────────────────────────
                 flops_M = None
                 try:
                     device = next(model.parameters()).device
                     _dummy = torch.randn(1, 3, 256, 256, device=device)
                     with FlopCounterMode(display=False) as fcm:
-                        _ = model.model.student(_dummy)
+                        _ = model.model.student_model(_dummy)
                     flops_M = round(fcm.get_total_flops() / 1e6, 1)
                     print(f"  → Student FLOPs: {flops_M:.1f} M")
                     del _dummy
                 except Exception:
                     pass
 
-                extractor = model.model.student
+                extractor = model.model.student_model
                 input_shape = (1, 3, 256, 256)
 
                 try:
@@ -437,7 +428,7 @@ summary = pd.concat(pieces)
 
 lines = []
 lines.append("=" * 140)
-lines.append(f"  EfficientAD-S  (N={N_RUNS}, PDN teacher_out=384, max_steps=70000)")
+lines.append(f"  STFPM  (N={N_RUNS}, ResNet-18, layers=[layer1,layer2,layer3], max_epochs={MAX_EPOCHS})")
 lines.append(f"  Raw CSV: {csv_path}")
 lines.append("=" * 140)
 lines.append(summary.to_string(float_format=lambda x: f"{x:.1f}" if pd.notna(x) else "—"))
