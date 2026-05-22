@@ -244,6 +244,11 @@ for run in range(N_RUNS):
                                                     image_f1max, pixel_f1max])
 
                 print(f"  → Building model (Dinomaly dinov2reg_vit_base_14)...")
+                # NOTE: fuse_layer_encoder / fuse_layer_decoder NOT passed
+                # explicitly because anomalib 2.4.2 torch_model.py has a bug
+                # (missing else branch L133-136) that drops custom values.
+                # Defaults DEFAULT_FUSE_LAYERS = [[0,1,2,3],[4,5,6,7]] already
+                # match Dinomaly paper Sec. 3.5 "Loose Constraint" (2 groups).
                 model = Dinomaly(
                     # (Sec. 3.1): DINOv2 with registers, ViT-B/14
                     encoder_name="dinov2reg_vit_base_14",
@@ -253,9 +258,6 @@ for run in range(N_RUNS):
                     decoder_depth=8,
                     # (Sec. 3.2): middle 8 of 12 encoder blocks (1-based 3..10)
                     target_layers=[2, 3, 4, 5, 6, 7, 8, 9],
-                    # (Sec. 3.5 "Loose Constraint"): 2 groups — low- and high-semantic
-                    fuse_layer_encoder=[[0, 1, 2, 3], [4, 5, 6, 7]],
-                    fuse_layer_decoder=[[0, 1, 2, 3], [4, 5, 6, 7]],
                     remove_class_token=False,
                     # (Sec. 4.1): resize 448 → center-crop 392 (= 28·14)
                     pre_processor=Dinomaly.configure_pre_processor(
