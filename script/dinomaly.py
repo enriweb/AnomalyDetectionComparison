@@ -1,14 +1,25 @@
 """
-Dinomaly
+Dinomaly (Guo et al., CVPR 2025 — "Dinomaly: The Less Is More Philosophy in
+Multi-Class Unsupervised Anomaly Detection")
 
 Usage:
     python dinomaly.py          # 1 run (default)
     python dinomaly.py 3        # 3 runs, results averaged
 
-Paper params (anomalib defaults): encoder dinov2reg_vit_base_14,
-  bottleneck_dropout=0.2, decoder_depth=8, target_layers=middle 8,
-  fuse groups [[0..3],[4..7]], image_size=448, crop_size=392,
-  batch=16, max_steps=5000.
+Paper config (Sec. 4.1, Tab. 1):
+    Encoder      : DINOv2-R ViT-B/14 (frozen)
+    Middle layers: 8 of 12 (indices 3..10 → 0-based [2..9])
+    Bottleneck   : MLP, dropout 0.2 (noisy bottleneck)
+    Decoder      : 8 ViT layers, linear attention
+    Loose recon  : 2 groups [[0..3], [4..7]] (low-/high-semantic)
+    Loss         : hard-mining global cosine, ratio 0..0.9 over 1000 steps
+    Optimizer    : StableAdamW, lr=2e-3, wd=1e-4, warmup 100, cosine
+    Resolution   : resize 448 → center-crop 392
+    Batch / steps: 16 / 5000
+    Eval         : Gaussian σ=4 kernel=5, max-ratio 0.01
+
+NOTE: paper trains one model jointly for all categories (MUAD).
+      This script trains per-category to match other thesis runners.
 
 Metrics recorded per run:
     Accuracy  — image AUROC, pixel AUROC, pixel AUPRO,
@@ -17,9 +28,9 @@ Metrics recorded per run:
                  deploy latency (raw frame -> anomaly decision, batch=1):
                  total mean/p95/p99 + per-stage pre/fwd/post breakdown
 
-Progress is checkpointed to results/dinomaly_progress.json after every
-completed run. On normal exit the checkpoint is deleted. On crash / OOM
-the checkpoint survives and the next invocation auto-resumes.
+Progress is checkpointed to results/dinomaly_results.csv after every completed
+run. On normal exit the checkpoint is deleted. On crash / OOM the checkpoint
+survives and the next invocation auto-resumes.
 """
 
 import gc
@@ -37,7 +48,6 @@ for _log in ("lightning", "lightning.pytorch", "anomalib", "torchvision", "torch
     logging.getLogger(_log).setLevel(logging.ERROR)
 print("Importing torch-related libraries...")
 import torch
-import torch.nn as nn
 from anomalib.data import MVTecAD, Visa
 from anomalib.engine import Engine
 from anomalib.metrics import AUPRO, AUROC, F1Max, Evaluator
@@ -46,18 +56,21 @@ from lightning.pytorch.callbacks import TQDMProgressBar
 from torch.utils.flop_counter import FlopCounterMode
 import pandas as pd
 
-torch.set_float32_matmul_precision("high")
+torch.set_float32_matmul_precision('high')
 
 # ── Config ────────────────────────────────────────────────────
 N_RUNS: int = int(sys.argv[1]) if len(sys.argv) > 1 else 1
+MAX_STEPS:  int = 5000   # Guo et al. 2025, Tab. 1 (training iterations)
+BATCH_SIZE: int = 16     # Guo et al. 2025, Sec. 4.1
+IMAGE_SIZE: int = 448    # resize side
+CROP_SIZE:  int = 392    # center crop (= 28*14, ViT-14 patch grid 28x28)
 
-# ── GPU cleanup helper ────────────────────────────────────────
+# ── GPU helpers ───────────────────────────────────────────────
 def free_gpu() -> None:
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
-
 
 # ── Inline efficiency helpers ─────────────────────────────────
 @torch.no_grad()
@@ -65,9 +78,9 @@ def _deploy_latency(model, raw_image, device="cuda", warmup=20, iters=200):
     """Per-image deployment latency: raw camera frame -> anomaly decision.
 
     Times the conveyor-belt inference path at batch=1:
-        preprocess  -- model.pre_processor: resize + normalize (CPU)
+        preprocess  -- model.pre_processor: resize + center-crop + normalize (CPU)
         h2d         -- host -> GPU copy
-        forward     -- model.model: features + scoring/kNN + anomaly map
+        forward     -- model.model: encoder + bottleneck + decoder + anomaly map
         postprocess -- model.post_processor: normalize + threshold -> decision
 
     raw_image : single CHW float tensor on CPU (one real test image at native
@@ -112,8 +125,8 @@ def _deploy_latency(model, raw_image, device="cuda", warmup=20, iters=200):
 
 
 @torch.no_grad()
-def _peak_gpu_mem(model: nn.Module,
-                  input_shape: tuple = (1, 3, 224, 224)) -> int | None:
+def _peak_gpu_mem(model,
+                  input_shape: tuple = (1, 3, 392, 392)):
     """Peak GPU allocated bytes for a single forward pass. None if no CUDA."""
     if not torch.cuda.is_available():
         return None
@@ -125,7 +138,6 @@ def _peak_gpu_mem(model: nn.Module,
     torch.cuda.synchronize()
     return int(torch.cuda.max_memory_allocated())
 
-
 # ── Single-line progress bar ──────────────────────────────────
 class CompactBar(TQDMProgressBar):
     def init_train_tqdm(self):
@@ -136,7 +148,6 @@ class CompactBar(TQDMProgressBar):
         bar = super().init_validation_tqdm(); bar.leave = False; return bar
     def init_predict_tqdm(self):
         bar = super().init_predict_tqdm(); bar.leave = False; return bar
-
 
 # ── Dataset config ────────────────────────────────────────────
 MVTEC_CATEGORIES = [
@@ -151,7 +162,7 @@ VISA_CATEGORIES = [
 
 DATASETS = [
     ("mvtec", MVTecAD, MVTEC_CATEGORIES, "./datasets/MVTecAD"),
-    ("visa", Visa, VISA_CATEGORIES, "./datasets/VisA"),
+    ("visa",  Visa,    VISA_CATEGORIES,  "./datasets/VisA"),
 ]
 
 total_categories = sum(len(c) for _, _, c, _ in DATASETS)
@@ -163,9 +174,8 @@ CKPT_DIR = "results/Dinomaly"
 
 # ── Startup banner ────────────────────────────────────────────
 print("=" * 60)
-print("  Dinomaly  |  Encoder: dinov2reg_vit_base_14")
-print("  dropout=0.2  |  decoder_depth=8  |  max_steps=5000")
-print("  image=448  |  crop=392  |  batch=16  |  layer_groups=2")
+print(f"  Dinomaly  |  encoder=dinov2reg_vit_base_14  |  decoder_depth=8")
+print(f"  dropout=0.2  |  image={IMAGE_SIZE}→crop={CROP_SIZE}  |  batch={BATCH_SIZE}  |  max_steps={MAX_STEPS}")
 print(f"  Runs per category : {N_RUNS}")
 print(f"  Categories total  : {total_categories}  ({len(MVTEC_CATEGORIES)} MVTec + {len(VISA_CATEGORIES)} VisA)")
 gpu_info = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU only"
@@ -183,7 +193,7 @@ else:
     print("\n[start] No CSV found — starting fresh.")
 
 # ── OOM skip tracking ─────────────────────────────────────────
-oom_skips: list[dict] = []   # {"ds": ..., "category": ..., "run": ...}
+oom_skips: list[dict] = []
 cycle_secs: list[float] = []
 t_total_start = time.time()
 
@@ -195,12 +205,11 @@ for run in range(N_RUNS):
     t_cycle_start = time.time()
 
     for ds_idx, (ds_name, DataModule, categories, root) in enumerate(DATASETS, 1):
-        print(f"\n{'─'*60}")
+        print(f"\n{'-'*60}")
         print(f"  Dataset {ds_idx}/{len(DATASETS)}: {ds_name.upper()}  ({len(categories)} categories)")
-        print(f"{'─'*60}")
+        print(f"{'-'*60}")
 
         for cat_idx, category in enumerate(categories, 1):
-            # Skip if this run index already completed for this category
             if len(results.get(ds_name, {}).get(category, [])) > run:
                 print(f"  [skip] {category} ({cat_idx}/{len(categories)}) — run {run+1} already done")
                 continue
@@ -218,11 +227,12 @@ for run in range(N_RUNS):
             t_run_start = time.time()
             try:
                 print(f"  → Loading datamodule...")
+                # (Sec. 4.1): batch size 16, no val split needed (fixed max_steps)
                 datamodule = DataModule(
                     root=root,
                     category=category,
-                    train_batch_size=16,
-                    eval_batch_size=16,
+                    train_batch_size=BATCH_SIZE,
+                    eval_batch_size=BATCH_SIZE,
                 )
 
                 image_auroc = AUROC(fields=["pred_score", "gt_label"], prefix="image_")
@@ -233,18 +243,24 @@ for run in range(N_RUNS):
                 evaluator = Evaluator(test_metrics=[image_auroc, pixel_auroc, pixel_pro,
                                                     image_f1max, pixel_f1max])
 
-                print("  → Building model (dinov2reg_vit_base_14)...")
+                print(f"  → Building model (Dinomaly dinov2reg_vit_base_14)...")
                 model = Dinomaly(
+                    # (Sec. 3.1): DINOv2 with registers, ViT-B/14
                     encoder_name="dinov2reg_vit_base_14",
+                    # (Sec. 3.3 "Noisy Bottleneck"): MLP dropout p=0.2
                     bottleneck_dropout=0.2,
+                    # (Sec. 3.4 / Tab. 1): 8 ViT decoder layers
                     decoder_depth=8,
+                    # (Sec. 3.2): middle 8 of 12 encoder blocks (1-based 3..10)
                     target_layers=[2, 3, 4, 5, 6, 7, 8, 9],
+                    # (Sec. 3.5 "Loose Constraint"): 2 groups — low- and high-semantic
                     fuse_layer_encoder=[[0, 1, 2, 3], [4, 5, 6, 7]],
                     fuse_layer_decoder=[[0, 1, 2, 3], [4, 5, 6, 7]],
                     remove_class_token=False,
+                    # (Sec. 4.1): resize 448 → center-crop 392 (= 28·14)
                     pre_processor=Dinomaly.configure_pre_processor(
-                        image_size=(448, 448),
-                        crop_size=392,
+                        image_size=(IMAGE_SIZE, IMAGE_SIZE),
+                        crop_size=CROP_SIZE,
                     ),
                     evaluator=evaluator,
                     visualizer=False,
@@ -253,16 +269,25 @@ for run in range(N_RUNS):
                 n_params = sum(p.numel() for p in model.parameters())
                 print(f"  → Parameters: {n_params:,}")
 
-                print("  → Training (max_steps=5000)...")
-                engine = Engine(max_steps=5000, devices="auto", strategy="auto", logger=False, callbacks=[CompactBar()])
+                print(f"  → Training (max_steps={MAX_STEPS})...")
+                # Optimizer / schedule (StableAdamW, lr=2e-3, wd=1e-4,
+                # warmup 100, cosine decay) handled in Dinomaly.configure_optimizers
+                # using the trainer's max_steps. Hard-mining cosine loss
+                # (ratio 0→0.9 over 1000 steps) handled inside model.forward.
+                engine = Engine(
+                    max_steps=MAX_STEPS,
+                    devices=1,
+                    logger=False,
+                    callbacks=[CompactBar()],
+                )
                 engine.fit(model=model, datamodule=datamodule)
-                print("  → Training complete.")
+                print(f"  → Training complete.")
 
-                # ── FLOPs: encoder forward pass on one image ──────────────────
+                # ── FLOPs: encoder forward on one image ────────────────────
                 flops_M = None
                 try:
                     device = next(model.parameters()).device
-                    _dummy = torch.randn(1, 3, 224, 224, device=device)
+                    _dummy = torch.randn(1, 3, CROP_SIZE, CROP_SIZE, device=device)
                     with FlopCounterMode(display=False) as fcm:
                         _ = model.model.encoder(_dummy)
                     flops_M = round(fcm.get_total_flops() / 1e6, 1)
@@ -271,9 +296,8 @@ for run in range(N_RUNS):
                 except Exception:
                     pass
 
-                # ── Single-forward peak mem ────────────────────────────────────
                 extractor = model.model.encoder
-                input_shape = (1, 3, 224, 224)
+                input_shape = (1, 3, CROP_SIZE, CROP_SIZE)
 
                 try:
                     peak_mem_1fwd = _peak_gpu_mem(extractor, input_shape=input_shape)
@@ -281,8 +305,8 @@ for run in range(N_RUNS):
                 except Exception:
                     peak_mem_1fwd = None
 
-                # ── GPU inference on test set ──────────────────────────────────
-                print("  → Running inference on test set (GPU)...")
+                # ── GPU inference on test set ─────────────────────────
+                print(f"  → Running inference on test set (GPU)...")
                 if torch.cuda.is_available():
                     torch.cuda.reset_peak_memory_stats()
 
@@ -292,7 +316,7 @@ for run in range(N_RUNS):
                 if torch.cuda.is_available():
                     peak_gpu_mb = round(torch.cuda.max_memory_allocated() / 1e6, 1)
 
-                # ── Deployment latency: raw frame -> anomaly decision ──────────
+                # ── Deployment latency: raw frame -> anomaly decision ──
                 try:
                     raw_img = datamodule.test_data[0].image
                     deploy = _deploy_latency(model, raw_img)
@@ -306,11 +330,11 @@ for run in range(N_RUNS):
                           f"| post {deploy['post']['mean']:.2f}]")
 
                 metrics = test_results[0]
-                img_auc  = metrics.get("image_AUROC", 0) * 100
-                pxl_auc  = metrics.get("pixel_AUROC", 0) * 100
-                pxl_pro  = metrics.get("pixel_AUPRO", 0) * 100
-                img_f1   = (metrics["image_F1Max"] * 100) if metrics.get("image_F1Max") is not None else None
-                pxl_f1   = (metrics["pixel_F1Max"] * 100) if metrics.get("pixel_F1Max") is not None else None
+                img_auc = metrics.get("image_AUROC", 0) * 100
+                pxl_auc = metrics.get("pixel_AUROC", 0) * 100
+                pxl_pro = metrics.get("pixel_AUPRO", 0) * 100
+                img_f1  = (metrics["image_F1Max"] * 100) if metrics.get("image_F1Max") is not None else None
+                pxl_f1  = (metrics["pixel_F1Max"] * 100) if metrics.get("pixel_F1Max") is not None else None
 
                 print(f"  → Results: Img AUROC {img_auc:.1f}% | Pxl AUROC {pxl_auc:.1f}%"
                       f" | AUPRO {pxl_pro:.1f}%"
@@ -444,7 +468,8 @@ summary = pd.concat(pieces)
 
 lines = []
 lines.append("=" * 140)
-lines.append(f"  Dinomaly  (N={N_RUNS}, Encoder: dinov2reg_vit_base_14, dropout=0.2, depth=8, max_steps=5000)")
+lines.append(f"  Dinomaly  (N={N_RUNS}, dinov2reg_vit_base_14, dropout=0.2, decoder_depth=8, "
+             f"image={IMAGE_SIZE}→{CROP_SIZE}, batch={BATCH_SIZE}, max_steps={MAX_STEPS})")
 lines.append(f"  Raw CSV: {csv_path}")
 lines.append("=" * 140)
 lines.append(summary.to_string(float_format=lambda x: f"{x:.1f}" if pd.notna(x) else "—"))
