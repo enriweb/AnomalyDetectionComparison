@@ -34,10 +34,11 @@ print("Importing torch-related libraries...")
 import torch
 import torch.nn as nn
 from anomalib.data import MVTecAD, Visa
+from anomalib.data.utils import ValSplitMode
 from anomalib.engine import Engine
 from anomalib.metrics import AUPRO, AUROC, F1Max, Evaluator
 from anomalib.models import Stfpm
-from lightning.pytorch.callbacks import TQDMProgressBar
+from lightning.pytorch.callbacks import ModelCheckpoint, TQDMProgressBar
 from torch.utils.flop_counter import FlopCounterMode
 import pandas as pd
 
@@ -208,12 +209,15 @@ for run in range(N_RUNS):
             t_run_start = time.time()
             try:
                 print(f"  → Loading datamodule...")
-                # (§4): image size 256×256
+                # (§4.2): image size 256×256, batch_size=32,
+                # 80/20 train→val split for checkpoint selection
                 datamodule = DataModule(
                     root=root,
                     category=category,
                     train_batch_size=32,
                     eval_batch_size=32,
+                    val_split_mode=ValSplitMode.FROM_TRAIN,
+                    val_split_ratio=0.2,
                 )
 
                 # Image-level AU-ROC
@@ -241,10 +245,29 @@ for run in range(N_RUNS):
                 print(f"  → Parameters: {n_params:,}")
 
                 print(f"  → Training (max_epochs={MAX_EPOCHS})...")
-                # (§4): SGD lr=0.4, momentum=0.9, weight_decay=1e-3, 100 epochs
-                engine = Engine(max_epochs=MAX_EPOCHS, devices=1, logger=False, callbacks=[CompactBar()])
+                # (§4.2): SGD lr=0.4, momentum=0.9, weight_decay=1e-3, 100 epochs;
+                # paper selects ckpt with lowest val loss. anomalib STFPM
+                # validation_step does not log a loss, so we monitor
+                # train_loss_epoch as a proxy (both are L2 feature distances on
+                # anomaly-free images, so they track closely).
+                ckpt_cb = ModelCheckpoint(
+                    dirpath=CKPT_DIR,
+                    monitor="train_loss_epoch",
+                    mode="min",
+                    save_top_k=1,
+                    filename="best",
+                )
+                engine = Engine(
+                    max_epochs=MAX_EPOCHS,
+                    devices=1,
+                    logger=False,
+                    callbacks=[CompactBar(), ckpt_cb],
+                )
                 engine.fit(model=model, datamodule=datamodule)
                 print(f"  → Training complete.")
+
+                # Load best checkpoint (paper §4.2: "lowest validation error")
+                best_ckpt = ckpt_cb.best_model_path or None
 
                 # ── FLOPs: student backbone forward on one image ────────────────────────
                 flops_M = None
@@ -273,7 +296,7 @@ for run in range(N_RUNS):
                 if torch.cuda.is_available():
                     torch.cuda.reset_peak_memory_stats()
 
-                test_results = engine.test(model=model, datamodule=datamodule)
+                test_results = engine.test(model=model, datamodule=datamodule, ckpt_path=best_ckpt)
 
                 peak_gpu_mb = 0.0
                 if torch.cuda.is_available():
