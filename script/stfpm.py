@@ -6,8 +6,8 @@ Usage:
     python stfpm.py 3        # 3 runs, results averaged
 
 Metrics recorded per run:
-    Accuracy  — image AUROC, pixel AUPRO,
-                image F1Max (optimal threshold)
+    Accuracy  — image AUROC, pixel AUROC, pixel AUPRO,
+                image F1Max, pixel F1Max (optimal threshold)
     Efficiency — n_params, FLOPs (student backbone, thop optional), peak GPU MB,
                  deploy latency (raw frame -> anomaly decision, batch=1):
                  total mean/p95/p99 + per-stage pre/fwd/post breakdown
@@ -220,12 +220,13 @@ for run in range(N_RUNS):
                     val_split_ratio=0.2,
                 )
 
-                # Image-level AU-ROC
                 image_auroc = AUROC(fields=["pred_score", "gt_label"], prefix="image_")
-                # Pixel-level AU-PRO — fpr_limit=0.3
-                pixel_pro = AUPRO(fields=["anomaly_map", "gt_mask"], prefix="pixel_")
+                pixel_auroc = AUROC(fields=["anomaly_map", "gt_mask"],  prefix="pixel_")
+                pixel_pro   = AUPRO(fields=["anomaly_map", "gt_mask"],  prefix="pixel_")
                 image_f1max = F1Max(fields=["pred_score", "gt_label"], prefix="image_")
-                evaluator = Evaluator(test_metrics=[image_auroc, pixel_pro, image_f1max])
+                pixel_f1max = F1Max(fields=["anomaly_map", "gt_mask"],  prefix="pixel_")
+                evaluator = Evaluator(test_metrics=[image_auroc, pixel_auroc, pixel_pro,
+                                                    image_f1max, pixel_f1max])
 
                 print(f"  → Building model (STFPM ResNet-18)...")
                 model = Stfpm(
@@ -317,20 +318,23 @@ for run in range(N_RUNS):
 
                 metrics = test_results[0]
                 img_auc = metrics.get("image_AUROC", 0) * 100
+                pxl_auc = metrics.get("pixel_AUROC", 0) * 100
                 pxl_pro = metrics.get("pixel_AUPRO", 0) * 100
                 img_f1  = (metrics["image_F1Max"] * 100) if metrics.get("image_F1Max") is not None else None
+                pxl_f1  = (metrics["pixel_F1Max"] * 100) if metrics.get("pixel_F1Max") is not None else None
 
-                print(f"  → Results: Img AUROC {img_auc:.1f}% | AUPRO {pxl_pro:.1f}%"
+                print(f"  → Results: Img AUROC {img_auc:.1f}% | Pxl AUROC {pxl_auc:.1f}%"
+                      f" | AUPRO {pxl_pro:.1f}%"
                       + (f" | F1Max {img_f1:.1f}%" if img_f1 is not None else ""))
                 print(f"  → Peak GPU: {peak_gpu_mb:.1f} MB")
 
                 run_wall_s = time.time() - t_run_start
                 run_record = {
                     "image_AUROC":     img_auc,
-                    "pixel_AUROC":     None,
+                    "pixel_AUROC":     pxl_auc,
                     "pixel_AUPRO":     pxl_pro,
                     "image_F1Max":     img_f1,
-                    "pixel_F1Max":     None,
+                    "pixel_F1Max":     pxl_f1,
                     "n_params":        n_params,
                     "flops_M":         flops_M,
                     "peak_gpu_mb":     peak_gpu_mb,
@@ -364,7 +368,7 @@ for run in range(N_RUNS):
                     raise
             finally:
                 del model, engine, datamodule, evaluator
-                del image_auroc, pixel_pro, image_f1max
+                del image_auroc, pixel_auroc, pixel_pro, image_f1max, pixel_f1max
                 del test_results, metrics
                 free_gpu()
                 shutil.rmtree(CKPT_DIR, ignore_errors=True)

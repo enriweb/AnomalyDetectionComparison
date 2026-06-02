@@ -251,7 +251,7 @@ for run in range(N_RUNS):
                 # match Dinomaly paper Sec. 3.5 "Loose Constraint" (2 groups).
                 model = Dinomaly(
                     # (Sec. 3.1): DINOv2 with registers, ViT-B/14
-                    encoder_name="dinov2reg_vit_base_14",
+                    encoder_name="dinov2reg_vit_small_14",
                     # (Sec. 3.3 "Noisy Bottleneck"): MLP dropout p=0.2
                     bottleneck_dropout=0.2,
                     # (Sec. 3.4 / Tab. 1): 8 ViT decoder layers
