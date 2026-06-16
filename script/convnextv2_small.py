@@ -50,6 +50,7 @@ import pandas as pd
 torch.set_float32_matmul_precision('high')
 
 N_RUNS: int = int(sys.argv[1]) if len(sys.argv) > 1 else 1
+BACKBONE_FILTER: str | None = sys.argv[2].lower() if len(sys.argv) > 2 else None
 
 CORESET = 0.25
 
@@ -157,7 +158,16 @@ DATASETS = [
 ]
 
 total_categories = sum(len(c) for _, _, c, _ in DATASETS)
-CKPT_DIR = "results/Patchcore"
+
+if BACKBONE_FILTER is not None:
+    CONFIGS = [(n, b, l) for n, b, l in CONFIGS if n.startswith(BACKBONE_FILTER)]
+    if not CONFIGS:
+        print(f"[error] No configs match backbone filter '{BACKBONE_FILTER}'. "
+              f"Valid: nano, pico, femto, atto")
+        sys.exit(1)
+
+CKPT_DIR = f"results/Patchcore_{BACKBONE_FILTER or 'all'}"
+LOG_DIR  = f"lightning_logs_{BACKBONE_FILTER or 'all'}"
 
 os.makedirs("results", exist_ok=True)
 
@@ -256,7 +266,8 @@ for variant_name, backbone, layers in CONFIGS:
 
                     print(f"  → Training (building coreset)...")
                     engine = Engine(max_epochs=1, devices="auto", strategy="auto",
-                                    logger=False, callbacks=[CompactBar()])
+                                    logger=False, callbacks=[CompactBar()],
+                                    default_root_dir=LOG_DIR)
                     engine.fit(model=model, datamodule=datamodule)
                     print(f"  → Coreset built.")
 
@@ -359,7 +370,7 @@ for variant_name, backbone, layers in CONFIGS:
                     del test_results, metrics
                     free_gpu()
                     shutil.rmtree(CKPT_DIR, ignore_errors=True)
-                    shutil.rmtree("lightning_logs", ignore_errors=True)
+                    shutil.rmtree(LOG_DIR, ignore_errors=True)
 
         cycle_secs.append(time.time() - t_cycle_start)
         print(f"\n  [{variant_name}] Cycle {run+1}/{N_RUNS} complete in "
