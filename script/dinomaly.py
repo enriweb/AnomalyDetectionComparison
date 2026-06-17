@@ -33,6 +33,7 @@ run. On normal exit the checkpoint is deleted. On crash / OOM the checkpoint
 survives and the next invocation auto-resumes.
 """
 
+import argparse
 import gc
 import logging
 import os
@@ -59,7 +60,16 @@ import pandas as pd
 torch.set_float32_matmul_precision('high')
 
 # ── Config ────────────────────────────────────────────────────
-N_RUNS: int = int(sys.argv[1]) if len(sys.argv) > 1 else 1
+_parser = argparse.ArgumentParser()
+_parser.add_argument("n_runs", nargs="?", type=int, default=1)
+_parser.add_argument("--instance", type=int, default=0, metavar="I",
+                     help="0-based instance index (for parallel runs)")
+_parser.add_argument("--total", type=int, default=1, metavar="M",
+                     help="total number of parallel instances")
+_args = _parser.parse_args()
+N_RUNS:      int = _args.n_runs
+INSTANCE:    int = _args.instance
+N_INSTANCES: int = _args.total
 MAX_STEPS:  int = 5000   # Guo et al. 2025, Tab. 1 (training iterations)
 BATCH_SIZE: int = 16     # Guo et al. 2025, Sec. 4.1
 IMAGE_SIZE: int = 448    # resize side
@@ -160,24 +170,36 @@ VISA_CATEGORIES = [
     "macaroni1", "macaroni2", "pcb1", "pcb2", "pcb3", "pcb4", "pipe_fryum",
 ]
 
+def _partition(cats: list, instance: int, total: int) -> list:
+    if total <= 1:
+        return cats
+    return [c for i, c in enumerate(cats) if i % total == instance]
+
+_mvtec = _partition(MVTEC_CATEGORIES, INSTANCE, N_INSTANCES)
+_visa   = _partition(VISA_CATEGORIES,  INSTANCE, N_INSTANCES)
+
 DATASETS = [
-    ("mvtec", MVTecAD, MVTEC_CATEGORIES, "./datasets/MVTecAD"),
-    ("visa",  Visa,    VISA_CATEGORIES,  "./datasets/VisA"),
+    ("mvtec", MVTecAD, _mvtec, "./datasets/MVTecAD"),
+    ("visa",  Visa,    _visa,  "./datasets/VisA"),
 ]
 
 total_categories = sum(len(c) for _, _, c, _ in DATASETS)
 
+_inst_suffix = f"_inst{INSTANCE}" if N_INSTANCES > 1 else ""
 os.makedirs("results", exist_ok=True)
-csv_path = "results/dinomaly_results.csv"
-combined_txt = "results/dinomaly_combined.txt"
-CKPT_DIR = "results/Dinomaly"
+csv_path     = f"results/dinomaly_results{_inst_suffix}.csv"
+combined_txt = f"results/dinomaly_combined{_inst_suffix}.txt"
+CKPT_DIR     = f"results/Dinomaly{_inst_suffix}"
+WORK_DIR     = f"lightning_logs{_inst_suffix}"
 
 # ── Startup banner ────────────────────────────────────────────
 print("=" * 60)
 print(f"  Dinomaly  |  encoder=dinov2reg_vit_base_14  |  decoder_depth=8")
 print(f"  dropout=0.2  |  image={IMAGE_SIZE}→crop={CROP_SIZE}  |  batch={BATCH_SIZE}  |  max_steps={MAX_STEPS}")
 print(f"  Runs per category : {N_RUNS}")
-print(f"  Categories total  : {total_categories}  ({len(MVTEC_CATEGORIES)} MVTec + {len(VISA_CATEGORIES)} VisA)")
+if N_INSTANCES > 1:
+    print(f"  Instance          : {INSTANCE}/{N_INSTANCES}")
+print(f"  Categories total  : {total_categories}  ({len(_mvtec)} MVTec + {len(_visa)} VisA)")
 gpu_info = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU only"
 print(f"  Device            : {gpu_info}")
 print("=" * 60)
@@ -281,6 +303,7 @@ for run in range(N_RUNS):
                     devices=1,
                     logger=False,
                     callbacks=[CompactBar()],
+                    default_root_dir=WORK_DIR,
                 )
                 engine.fit(model=model, datamodule=datamodule)
                 print(f"  → Training complete.")
@@ -387,7 +410,7 @@ for run in range(N_RUNS):
                 del test_results, metrics
                 free_gpu()
                 shutil.rmtree(CKPT_DIR, ignore_errors=True)
-                shutil.rmtree("lightning_logs", ignore_errors=True)
+                shutil.rmtree(WORK_DIR, ignore_errors=True)
 
     cycle_secs.append(time.time() - t_cycle_start)
     print(f"\n  Cycle {run+1}/{N_RUNS} complete in {cycle_secs[-1]:.1f}s ({cycle_secs[-1]/60:.1f} min)")
