@@ -30,6 +30,7 @@ for _log in ("lightning", "lightning.pytorch", "anomalib", "torchvision", "torch
 print("Importing torch-related libraries")
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from anomalib.data import MVTecAD, Visa
 from anomalib.engine import Engine
 from anomalib.metrics import AUPRO, AUROC, F1Max, Evaluator
@@ -175,13 +176,43 @@ t_total_start = time.time()
 
 
 class FastViTPatchcoreModel(PatchcoreModel):
-    """PatchcoreModel forced to use FastViT-SA12 as feature extractor."""
+    """PatchcoreModel using FastViT-SA12 with parameter-free cross-scale
+    attention (CSA) fusion instead of PatchCore's plain concat."""
     def __init__(self, **kw):
         kw.setdefault("backbone", "fastvit_sa12")
         kw.setdefault("layers", ["stages.2", "stages.3"])
         kw.setdefault("pre_trained", True)
         kw.setdefault("num_neighbors", 9)
         super().__init__(**kw)
+
+    def generate_embedding(self, features: dict) -> torch.Tensor:
+        """Cross-scale attention fusion (parameter-free).
+
+        Baseline PatchCore upsamples the coarse map and concatenates it to the
+        fine map (channel-wise). Here the coarse, high-semantic scale
+        (``layers[-1]``) is first refined by a non-local self-attention before
+        fusion: it is upsampled to the fine grid, L2-normalized per location,
+        and a softmax cosine-affinity matrix re-aggregates its own features,
+        injecting global semantic context. The refined coarse map is then
+        concatenated with the fine, high-resolution scale (``layers[0]``).
+
+        No learned parameters -> preserves PatchCore's gradient-free property.
+        Output channel dim equals the plain-concat baseline (C_fine + C_coarse),
+        so memory-bank size and efficiency stay directly comparable.
+        """
+        fine = features[self.layers[0]]            # (B, Cf, Hf, Wf) local
+        coarse = features[self.layers[-1]]         # (B, Cc, Hc, Wc) semantic
+
+        coarse_up = F.interpolate(coarse, size=fine.shape[-2:], mode="bilinear")
+        b, cc, hf, wf = coarse_up.shape
+        n = hf * wf
+
+        tokens = coarse_up.permute(0, 2, 3, 1).reshape(b, n, cc)   # (B, N, Cc)
+        tokens_n = F.normalize(tokens, dim=-1)
+        affinity = torch.softmax(tokens_n @ tokens_n.transpose(1, 2), dim=-1)
+        coarse_ctx = (affinity @ tokens).reshape(b, hf, wf, cc).permute(0, 3, 1, 2)
+
+        return torch.cat((fine, coarse_ctx), dim=1)
 
 
 class FastViTPatchcore(Patchcore):
